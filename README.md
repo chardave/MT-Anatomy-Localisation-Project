@@ -23,5 +23,6 @@ In nanodrr-test folder:
     - this is just to view, as nanodrr can accept affine (stick to original as we would need to change the segmentation file too) 
 
 **Find_composite_candidate.py**
+
     - go through all of the segmentations and find which region each scan belongs mostly to (which will help us to put together body parts with the most labels present) 
     - all outputs in composite_candidate_output folder in metadata folder 

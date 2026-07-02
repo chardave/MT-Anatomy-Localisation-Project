@@ -4,6 +4,7 @@ import pandas as pd
 from adapters.topaneu_adapter import build_topaneu_records
 from adapters.totalsegmentator_adapter import build_totalsegmentator_records
 from adapters.sega_adapter import build_sega_records
+from adapters.asoca_adapter import build_asoca_records
 
 DATASETS = {
     "topaneu": Path(
@@ -14,7 +15,11 @@ DATASETS = {
     ),
     "sega": Path(
         r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\SegA"
+    ),
+    "asoca": Path(
+        r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\ASOCA"
     )
+
 }
 
 
@@ -49,6 +54,15 @@ print(f"Finished SegA: {len(sega_records)} records found", flush=True)
 
 all_records.extend(sega_records)
 
+print("\nStarting ASOCA indexing...", flush=True)
+
+asoca_records = build_asoca_records(
+    DATASETS["asoca"],
+    annotation_type="manual",
+    )
+
+all_records.extend(asoca_records)
+
 rows = []
 
 for record in all_records:
@@ -64,7 +78,7 @@ for record in all_records:
 
 df = pd.DataFrame(rows)
 
-output_path = Path("metadata") / "scan_index.csv"
+output_path = Path("C:/Users/cd26/OneDrive - King's College London/MT Anatomy Localisation Project/MT-Anatomy-Localisation-Project/metadata/scan_index.csv")
 output_path.parent.mkdir(exist_ok=True)
 
 df.to_csv(output_path, index=False)

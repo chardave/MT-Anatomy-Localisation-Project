@@ -1,42 +1,78 @@
-# MT-Anatomy-Localisation-Project
-Live anatomy localisation on fluoroscopy videos during Mechanical Thrombectomy procedures
+# MT Anatomy Localisation Project
 
-<<<<<<< HEAD
-In nanodrr-test folder:
+Live anatomy localisation on fluoroscopy videos during mechanical thrombectomy procedures.
 
-**fluoroscopy_sim.py** 
+This repository contains scripts for building a multi-dataset CT/CTA scan index, preparing anatomical labelmaps, and running interactive fluoroscopy / DRR simulation using nanoDRR.
 
-=======
-In nanodrr-test folder: 
-    **fluoroscopy_sim.py** 
->>>>>>> e0bd3e6 (Update README files)
-    - run to open fluoroscopy simulation app using GPU
-    - simulates C-Arm Control 
-    - can change input ct image and segmentation by browsing folders
-    - can choose which segmentations to impose
+---
 
-**Build scan index.py** 
-<<<<<<< HEAD
+## Main tools
 
-=======
->>>>>>> e0bd3e6 (Update README files)
-    - saves the details of each scan from multiple datasets in one csv file 
-    - saves case_id, dataset, image_path, label_path (to input into the subject class in the nanodrr script), anatomical regiod, labels present, and annotation type (manual/automatic) 
-    - each dataset will have its own adapter script that will output the image and label path - in the adapter folder
+### `nanodrr-test/fluoroscopy_sim.py`
 
-**Check_ct.py** 
-<<<<<<< HEAD
+Interactive fluoroscopy simulation app.
 
-=======
->>>>>>> e0bd3e6 (Update README files)
-    - repairs the NIfTI header geometry so that ITK accepts the file. 
-    - current scans probably have affine matrix however ITK only supports orthonormal direction cosines 
-    - this is just to view, as nanodrr can accept affine (stick to original as we would need to change the segmentation file too) 
+Features:
 
-**Find_composite_candidate.py**
-<<<<<<< HEAD
+- Runs a PySide6 fluoroscopy simulation interface.
+- Uses GPU acceleration through PyTorch/CUDA when available.
+- Simulates C-arm pose control.
+- Allows the user to change the input CT image and segmentation by browsing local files.
+- Allows selected segmentations to be imposed on the simulated fluoroscopy view.
+- Supports toggling and selecting visible anatomical labels.
 
-=======
->>>>>>> e0bd3e6 (Update README files)
-    - go through all of the segmentations and find which region each scan belongs mostly to (which will help us to put together body parts with the most labels present) 
-    - all outputs in composite_candidate_output folder in metadata folder 
+---
+
+### `build_scan_index.py`
+
+Builds a unified scan index across multiple datasets.
+
+The output CSV stores:
+
+- `case_id`
+- `dataset`
+- `image_path`
+- `label_path`
+- `anatomical_region`
+- `labels_present`
+- `annotation_type`
+
+Each dataset has its own adapter script in the `adapters/` folder. The adapter scripts standardise different dataset folder structures into a common `ScanRecord` format.
+
+---
+
+### `adapters/`
+
+Dataset-specific adapters.
+
+Current adapters include:
+
+- TotalSegmentator
+- TopAneu
+- SegA
+- ASOCA
+
+Each adapter finds valid image/segmentation pairs and assigns useful metadata such as anatomical region, labels present, and annotation type.
+
+---
+
+### `check_ct.py`
+
+Repairs NIfTI header geometry so that ITK-compatible tools can open the file.
+
+Some scans contain affine matrices that are accepted by nanoDRR but not by ITK-based tools. ITK requires orthonormal direction cosines, so this script is mainly useful for viewing scans in tools such as 3D Slicer or ITK-SNAP.
+
+For nanoDRR experiments, the original scan should usually be kept unless the corresponding segmentation is corrected in the same way.
+
+---
+
+### `find_composite_candidate.py`
+
+Searches through available segmentations to identify which anatomical region each scan mainly represents.
+
+This is used to help select candidate scans for building composite body-region examples.
+
+Outputs are saved in:
+
+```text
+metadata/composite_candidate_output/

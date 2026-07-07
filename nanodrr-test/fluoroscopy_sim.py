@@ -33,8 +33,6 @@ from nanodrr.data import Subject
 from nanodrr.camera import make_k_inv, make_rt_inv
 from nanodrr.drr import render
 
-from nanodrr_tests.fluoro_selectable_segmentations import overlay_labels_on_rgb
-
 # USER PATHS - starts with default s0224 from total_segmentator
 # can be changed in the app
 #==================================================================================
@@ -50,7 +48,7 @@ LABEL_PATH = Path(
 # Label mapping assigns labels to label IDs - this can be used to add the labels from 
 # other datasets which may have different names to all align to the same label name
 LABEL_MAPPING_CSV = Path(
-    r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\metadata\totalsegmentator_label_mapping.csv"
+    r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\MT-Anatomy-Localisation-Project\metadata\totalsegmentator_label_mapping.csv"
 )
 
 # original will only tick these default labels then others can be be imposed when checked
@@ -208,33 +206,32 @@ def render_ct_projection(
 
     return img_np
 
-# renders the label projections with the CT, but then ignores channel 0
-# then collapses the label channels into one 2D label projection that 
-# can be overlayed on top of the image
-def render_label_projection(
+# render projected segmentation labels as seperate per-label channels
+def render_label_channels(
         subject_labels,
-        k_inv,
+        k_inv, 
         rt_inv,
         sdd,
         height,
         width,
 ):
+    
     with torch.no_grad():
         label_img = render(subject_labels, k_inv, rt_inv, sdd, height, width)
+    
+    label_cpu = label_img.detach().cpu()
+    
+    if label_cpu.ndim !=4: 
+        raise ValueError(f"Expected nanoDRR output [B, C, H, W], got {label_cpu.shape}")
+    
+    if label_cpu.shape[1] > 1:
+        # Channel 0 is the CT/DRR channel. Channels 1..N are label projections.
+        label_channels = label_cpu[0, 1:, :, :]
+    else:
+        # fallback for label-only subjects (no CT channel). Channel 0 is the label projection.
+        label_channels = label_cpu[0, 0:1, :, :]
 
-        label_cpu = label_img.detach().cpu()
-
-        if label_cpu.shape[1] > 1:
-            label_scores = label_cpu[:, 1:, :, :]
-            max_vals, label_proj = label_scores.max(dim=1)
-
-            label_proj = label_proj + 1
-            label_proj[max_vals <= 0] = 0
-        else:
-            label_proj = label_cpu[:, 0, :, :]
-        
-        label_proj = label_proj[0].numpy().astype(np.int32)
-        return label_proj
+    return label_channels.numpy().astype(np.float32)
 
 # ============================================================
 # Segmentation overlay helpers
@@ -306,31 +303,50 @@ def dilate_mask(mask, iterations=1):
 
     return mask
 
-def overlay_labels_onrbg(
+def overlay_labels_channels_on_rgb(
         rgb,
-        label_proj,
-        fill_alpha=0.3,
-        border_width=1
+        label_channels,
+        visible_label_ids = None,
+        fill_alpha=0.30,
+        border_width=2,
+        label_threshold=0.0,
 ):
     out = rgb.astype(np.float32).copy()
 
-    present_labels = np.unique(label_proj)
-    present_labels = present_labels[present_labels != 0]
+    if label_channels is None or label_channels.size == 0:
+        return rgb
+    
+    n_labels = int(label_channels.shape[0])
 
-    for label_id in present_labels:
-        mask = label_proj == label_id
+    if visible_label_ids is None:
+        visible_ids = list(range(1, n_labels + 1))
+    else:
+        visible_ids = sorted(int(x) for x in visible_label_ids)
+    
+    masks_to_border = []
+
+    for label_id in visible_ids:
+
+        channel_idx = label_id - 1
+
+        if channel_idx < 0 or channel_idx >= n_labels:
+            continue
+        
+        mask = label_channels[channel_idx] > label_threshold
+
+        if not np.any(mask):
+            continue
+
         colour = label_to_colour(label_id)
 
-        #semi-transparent fill
-        out[mask] = (1.0 - fill_alpha) * out[mask] + fill_alpha * colour
+        out[mask] = (1.0 -fill_alpha) * out[mask] + fill_alpha * colour
+        masks_to_border.append((label_id, mask))
     
-    # draw borders after fills so borders remain visible
-    for label_id in present_labels:
-        mask = label_proj == label_id
+    for label_id, mask in masks_to_border:
         border = mask_border(mask)
 
         if border_width > 1:
-            border = dilate_mask(border, iterations=border_width -1)
+            border = dilate_mask(border, iterations=border_width - 1)
         
         colour = label_to_colour(label_id)
         out[border] = colour
@@ -357,7 +373,7 @@ def render_pose_rgb(
         trans_x=float(params["trans_x"]),
         trans_y=float(params["trans_y"]),
         trans_z=float(params["trans_z"]),
-        ssd_value=float(params["sdd"]),
+        sdd_value=float(params["sdd"]),
         height=height,
         width=width,
         pixel_size=float(params["pixel_size"]),
@@ -374,9 +390,9 @@ def render_pose_rgb(
 
     rgb = greyscale_to_rgb_uint8(ct_np)
 
-    if params.get("show_segmentation", False):
+    if params.get("show_segmentations", False):
         if subject_labels is not None:
-            label_proj = render_label_projection(
+            label_channels = render_label_channels(
                 subject_labels=subject_labels,
                 k_inv=k_inv,
                 rt_inv=rt_inv,
@@ -387,22 +403,13 @@ def render_pose_rgb(
 
             visible_label_ids = params.get("visible_label_ids", None)
 
-            if visible_label_ids is not None:
-                if len(visible_label_ids) == 0:
-                    label_proj = np.zeros_like(label_proj)
-                else:
-                    visible_ids_array = np.array(
-                        sorted(list(visible_label_ids)),
-                        dtype=np.int32,
-                    )
-                    keep_mask = np.isin(label_proj, visible_ids_array)
-                    label_proj = np.where(keep_mask, label_proj, 0)
-
-            rgb = overlay_labels_on_rgb(
+            rgb = overlay_labels_channels_on_rgb(
                 rgb=rgb,
-                label_proj=label_proj,
+                label_channels=label_channels,
+                visible_label_ids = visible_label_ids,
                 fill_alpha=float(params.get("fill_alpha", 0.30)),
                 border_width=int(params.get("border_width", 2)),
+                label_threshold=float(params.get("label_threshold", 0.0)),
             )
 
     return rgb
@@ -453,7 +460,7 @@ class FloatSlider(QWidget):
         self.slider.setValue(int(round(value * self.scale)))
     
     def _update_label(self, value):
-        self.label.setText(f"{self.name}: {value:,{self.decimals}f}")
+        self.label.setText(f"{self.name}: {value:.{self.decimals}f}")
     
     def _emit_value(self, raw_value):
         value = raw_value / self.scale
@@ -470,7 +477,7 @@ class RenderSignals(QObject):
     error = Signal(str)
     finished = Signal()
 
-#
+#collects commands from the sliders so that the gui looks smooth
 class RenderWorker(QRunnable):
     def __init__(
             self,
@@ -566,6 +573,7 @@ class FluoroControlWindow(QMainWindow):
             "show_segmentations": False,
             "fill_alpha": 0.30,
             "border_width": 2,
+            "label_threshold": 0.0,
             "visible_label_ids": starting_visible_ids,
         }
 
@@ -750,7 +758,10 @@ class FluoroControlWindow(QMainWindow):
                 label_list_layout.addWidget(checkbox)
 
             label_list_layout.addStretch()
-            label_scroll.setWidget(label_scroll)
+            label_scroll.setWidget(label_widget)
+
+            seg_layout.addWidget(QLabel("Visible labels"))
+            seg_layout.addWidget(label_scroll)
         else:
             seg_layout.addWidget(
                 QLabel("No label mapping available. Individual label selection is disabled.\n"
@@ -782,6 +793,13 @@ class FluoroControlWindow(QMainWindow):
         detector_group = QGroupBox("Detector Controls")
         detector_layout = QVBoxLayout()
         detector_group.setLayout(detector_layout)
+        
+        self.sdd_box = QDoubleSpinBox()
+        self.sdd_box.setRange(500.0, 2000.0)
+        self.sdd_box.setSingleStep(10.0)
+        self.sdd_box.setValue(self.params["sdd"])
+        detector_layout.addWidget(QLabel("SDD"))
+        detector_layout.addWidget(self.sdd_box)
 
         self.pixel_size_box = QDoubleSpinBox()
         self.pixel_size_box.setRange(0.5, 5.0)
@@ -836,285 +854,285 @@ class FluoroControlWindow(QMainWindow):
 
         return panel
 
-def _make_image_panel(self):
-    panel = QWidget()
-    layout = QVBoxLayout()
-    panel.setLayout(layout)
+    def _make_image_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout()
+        panel.setLayout(layout)
 
-    title = QLabel("Live Simulated Fluoroscopy / DRR")
-    title.setAlignment(Qt.AlignCenter)
-    layout.addWidget(title)
+        title = QLabel("Live Simulated Fluoroscopy / DRR")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
 
-    self.image_label = QLabel()
-    self.image_label.setAlignment(Qt.AlignCenter)
-    self.image_label.setMinimumSize(400, 400)
-    self.image_label.setStyleSheet("background-color: black;")
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setMinimumSize(400, 400)
+        self.image_label.setStyleSheet("background-color: black;")
 
-    layout.addWidget(self.image_label, stretch=1)
+        layout.addWidget(self.image_label, stretch=1)
 
-    return panel
+        return panel
 
-def browse_image_file(self):
-    file_path, _ = QFileDialog.getOpenFileName(
-        self,
-        "Select CT Image File",
-        str(self.image_path.parent if self.image_path else Path.home()),
-        "Medical images (*.nii *.nii.gz *.nrrd);;All Files (*)",
-    )
-
-    if file_path:
-        self.image_path = Path(file_path)
-        self.image_path_edit.setText(str(self.image_path))
-
-def browse_label_file(self):
-    start_dir = self.image_path.parent if self.image_path else Path.home()
-
-    file_path, _ = QFileDialog.getOpenFileName(
-        self,
-        "Select Segmentation Label File",
-        str(start_dir),
-        "Medical images (*.nii *.nii.gz *.nrrd);;All Files (*)",
-    )
-
-    if file_path:
-        self.label_path = Path(file_path)
-        self.label_path_edit.setText(str(self.label_path))
-    
-
-def clear_label_file(self):
-    self.label_path = None
-    self.label_path_edit.setText("")
-
-def reload_selected_files(self):
-    try:
-        self.status_label.setText("Loading selected files...")
-        QApplication.processEvents()
-
-        self._load_subjects()
-
-        if self.subject_labels is None:
-            self.seg_button.setChecked(False)
-            self.seg_button.setEnabled(False)
-            self.seg_button.setToolTip("No segmentation file loaded.")
-            self.params["show_segmentations"] = False
-        
-        else:
-            self.seg_button.setEnabled(True)
-            self.seg_button.setText(
-                "Hide Segmentations"
-                if self.params["show_segmentations"]
-                else "Impose Segmentations")
-            
-        self.request_render()
-    
-    except Exception as exc:
-        error_text = traceback.format_exc()
-        print(error_text)
-
-        QMessageBox.critical(
+    def browse_image_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "File Load Error",
-            f"Could not load the selected filesL \n\n{exc}",
+            "Select CT Image File",
+            str(self.image_path.parent if self.image_path else Path.home()),
+            "Medical images (*.nii *.nii.gz *.nrrd);;All Files (*)",
         )
 
-        self.status_label.setText("Error loading files.")
+        if file_path:
+            self.image_path = Path(file_path)
+            self.image_path_edit.setText(str(self.image_path))
 
-def set_param(self, key, value):
-    self.params[key] = value
-    self.request_render()
+    def browse_label_file(self):
+        start_dir = self.image_path.parent if self.image_path else Path.home()
 
-def on_label_checkbox_toggled(self, label_id, checked):
-    visible = self.params.get("visible_label_ids", set())
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Segmentation Label File",
+            str(start_dir),
+            "Medical images (*.nii *.nii.gz *.nrrd);;All Files (*)",
+        )
 
-    if visible is None:
-        visible = set(self.label_id_to_name.keys())
-    
-    visible = set(visible)
+        if file_path:
+            self.label_path = Path(file_path)
+            self.label_path_edit.setText(str(self.label_path))
+        
 
-    if checked:
-        visible.add(label_id)
-    else:
-        visible.discard(label_id)
-    
-    self.params["visible_label_ids"] = visible
+    def clear_label_file(self):
+        self.label_path = None
+        self.label_path_edit.setText("")
 
-    if self.params.get("show_segmentations", False):
+    def reload_selected_files(self):
+        try:
+            self.status_label.setText("Loading selected files...")
+            QApplication.processEvents()
+
+            self._load_subjects()
+
+            if self.subject_labels is None:
+                self.seg_button.setChecked(False)
+                self.seg_button.setEnabled(False)
+                self.seg_button.setToolTip("No segmentation file loaded.")
+                self.params["show_segmentations"] = False
+            
+            else:
+                self.seg_button.setEnabled(True)
+                self.seg_button.setText(
+                    "Hide Segmentations"
+                    if self.params["show_segmentations"]
+                    else "Impose Segmentations")
+                
+            self.request_render()
+        
+        except Exception as exc:
+            error_text = traceback.format_exc()
+            print(error_text)
+
+            QMessageBox.critical(
+                self,
+                "File Load Error",
+                f"Could not load the selected filesL \n\n{exc}",
+            )
+
+            self.status_label.setText("Error loading files.")
+
+    def set_param(self, key, value):
+        self.params[key] = value
         self.request_render()
 
-def set_visible_labels(self, label_ids):
-    if label_ids is None:
-        visible = None
-    else: 
-        visible = set(label_ids)
-    
-    self.params["visible_label_ids"] = visible
-
-    # update the checkboxes to reflect the new visible labels
-    for label_id, checkbox in self.label_checkboxed.items():
-        checkbox.blockSignals(True)
+    def on_label_checkbox_toggled(self, label_id, checked):
+        visible = self.params.get("visible_label_ids", set())
 
         if visible is None:
-            checkbox.setChecked(True)
-        else:
-            checkbox.setChecked(label_id in visible)
+            visible = set(self.label_id_to_name.keys())
         
-        checkbox.blockSignals(False)
+        visible = set(visible)
 
-    if self.params.get("show_segmentations", False):
+        if checked:
+            visible.add(label_id)
+        else:
+            visible.discard(label_id)
+        
+        self.params["visible_label_ids"] = visible
+
+        if self.params.get("show_segmentations", False):
+            self.request_render()
+
+    def set_visible_labels(self, label_ids):
+        if label_ids is None:
+            visible = None
+        else: 
+            visible = set(label_ids)
+        
+        self.params["visible_label_ids"] = visible
+
+        # update the checkboxes to reflect the new visible labels
+        for label_id, checkbox in self.label_checkboxes.items():
+            checkbox.blockSignals(True)
+
+            if visible is None:
+                checkbox.setChecked(True)
+            else:
+                checkbox.setChecked(label_id in visible)
+            
+            checkbox.blockSignals(False)
+
+        if self.params.get("show_segmentations", False):
+            self.request_render()
+
+    def select_default_labels(self):
+        ids = default_visible_label_ids(self.label_name_to_id)
+
+        # if the default labels are not found in the mapping, fall back to all labels
+        if not ids:
+            ids = set(self.label_id_to_name.keys())
+        
+        self.set_visible_labels(ids)
+
+    def select_all_labels(self):
+        self.set_visible_labels(set(self.label_id_to_name.keys()))
+
+    def clear_all_labels(self):
+        self.set_visible_labels(set())
+
+    def set_segmentation_overlay(self, checked):
+        self.params["show_segmentations"] = bool(checked)
+
+        if checked:
+            self.seg_button.setText("Hide Segmentations")
+        else:
+            self.seg_button.setText("Impose Segmentations")
+        
         self.request_render()
 
-def select_default_labels(self):
-    ids = default_visible_label_ids(self.label_name_to_id)
+    def reset_pose(self):
+        defaults = {
+            "rot_x": 0.0,
+            "rot_y": 0.0,
+            "rot_z": 0.0,
+            "trans_x": 0.0,
+            "trans_y": 850.0,
+            "trans_z": 0.0,
+        }
 
-    # if the default labels are not found in the mapping, fall back to all labels
-    if not ids:
-        ids = set(self.label_id_to_name.keys())
-    
-    self.set_visible_labels(ids)
+        widgets = [
+            self.rot_x_slider,
+            self.rot_y_slider,
+            self.rot_z_slider,
+            self.trans_x_slider,
+            self.trans_y_slider,
+            self.trans_z_slider,
+        ]
 
-def select_all_labels(self):
-    self.set_visible_labels(set(self.label_id_to_name.keys()))
+        for w in widgets:
+            w.blockSignals(True)
+            self.rot_x_slider.set_value(defaults["rot_x"])
+            self.rot_y_slider.set_value(defaults["rot_y"])
+            self.rot_z_slider.set_value(defaults["rot_z"])
+            self.trans_x_slider.set_value(defaults["trans_x"])
+            self.trans_y_slider.set_value(defaults["trans_y"])
+            self.trans_z_slider.set_value(defaults["trans_z"]) 
+        
+        for w in widgets:
+            w.blockSignals(False)
+        
+        self.params.update(defaults)
+        self.request_render()
 
-def clear_all_labels(self):
-    self.set_visible_labels(set())
-
-def set_segmentation_overlay(self, checked):
-    self.params["show_segmentations"] = bool(checked)
-
-    if checked:
-        self.seg_button.setText("Hide Segmentations")
-    else:
-        self.seg_button.setText("Impose Segmentations")
-    
-    self.request_render()
-
-def reset_pose(self):
-    defaults = {
-        "rot_x": 0.0,
-        "rot_y": 0.0,
-        "rot_z": 0.0,
-        "trans_x": 0.0,
-        "trans_y": 850.0,
-        "trans_z": 0.0,
-    }
-
-    widgets = [
-        self.rot_x_slider,
-        self.rot_y_slider,
-        self.rot_z_slider,
-        self.trans_x_slider,
-        self.trans_y_slider,
-        self.trans_z_slider,
-    ]
-
-    for w in widgets:
-        w.blockSignals(True)
-        self.rot_x_slider.set_value(defaults["rot_x"])
-        self.rot_y_slider.set_value(defaults["rot_y"])
-        self.rot_z_slider.set_value(defaults["rot_z"])
-        self.trans_x_slider.set_value(defaults["trans_x"])
-        self.trans_y_slider.set_value(defaults["trans_y"])
-        self.trans_z_slider.set_value(defaults["trans_z"]) 
-    
-    for w in widgets:
-        w.blockSignals(False)
-    
-    self.params.update(defaults)
-    self.request_render()
-
-# render immediately if no render is running, otherwise set a flag to request a render after the current one finishes
-def request_render(self):
-    if self.render_running:
-        self.render_requested = True
-        return
-    
-    self.start_render()
-
-def start_render(self):
-    self.render_running = True
-    self.render_requested = False
-
-    params_snapshot = dict(self.params)
-
-    if params_snapshot.get("show_segmentations", False):
-        self.status_label.setText("Rendering with segmentations...")
-    else:
-        self.status_label.setText("Rendering...")
-    
-    worker = RenderWorker(
-        subject_ct=self.subject_ct,
-        subject_labels=self.subject_labels,
-        subject_isocenter=self.subject_isocenter,
-        device=self.device,
-        params=params_snapshot,
-    )
-
-    worker.signals.result.connect(self.on_render_result)
-    worker.signals.error.connect(self.on_render_error)
-    worker.signals.finished.connect(self.on_render_finished)
-
-    self.threadpool.start(worker)
-
-def on_render_result(self, rgb, elapsed):
-    self.current_rgb = rgb
-    self.update_image_display()
-
-    h, w = rgb.shape[:2]
-
-    overlay_text = "overlay ON" if self.params["show_segmentations"] else "overlay OFF"
-
-    visible_ids = self.params.get("visible_label_ids", None)
-    if visible_ids is None:
-        selected_text = "all labels"
-    else:
-        selected_text = f"{len(visible_ids)} selected"
-    
-    self.status_label.setText(
-        f"Rendered on {self.device} | {w} x{h} | "
-        f"{elapsed: .3f} s | {overlay_text} | {selected_text}"
-    )
-
-def on_render_error(self, error_text):
-    print(error_text)
-    self.status_label.setText("Render failed. see terminal for traceback,")
-
-def on_render_finished(self):
-    self.render_running = False
-
-    if self.render_requested:
+    # render immediately if no render is running, otherwise set a flag to request a render after the current one finishes
+    def request_render(self):
+        if self.render_running:
+            self.render_requested = True
+            return
+        
         self.start_render()
 
-def update_image_label(self, rgb):
-    h, w, c = rgb.shape
+    def start_render(self):
+        self.render_running = True
+        self.render_requested = False
 
-    if c != 3:
-        raise ValueError(f"Expected RGB image with 3 channels, got {c} channels.")
-    
-    bytes_per_line = 3 * w
+        params_snapshot = dict(self.params)
 
-    q_image = QImage(
-        rgb.data,
-        w,
-        h,
-        bytes_per_line,
-        QImage.Format_RGB888,
-    ).copy()
-    
-    pixmap = QPixmap.fromImage(q_image)
+        if params_snapshot.get("show_segmentations", False):
+            self.status_label.setText("Rendering with segmentations...")
+        else:
+            self.status_label.setText("Rendering...")
+        
+        worker = RenderWorker(
+            subject_ct=self.subject_ct,
+            subject_labels=self.subject_labels,
+            subject_isocenter=self.subject_isocenter,
+            device=self.device,
+            params=params_snapshot,
+        )
 
-    scaled = pixmap.scaled(
-        self.image_label.size(),
-        Qt.KeepAspectRatio,
-        Qt.SmoothTransformation,
-    )
+        worker.signals.result.connect(self.on_render_result)
+        worker.signals.error.connect(self.on_render_error)
+        worker.signals.finished.connect(self.on_render_finished)
 
-    self.image_label.setPixmap(scaled)
+        self.threadpool.start(worker)
 
-def resizeEvent(self, event):
-    super().resizeEvent(event)
+    def on_render_result(self, rgb, elapsed):
+        self.current_rgb = rgb
+        self.update_image_label(rgb)
 
-    if self.current_rgb is not None:
-        self.update_image_display(self.current_rgb)
+        h, w = rgb.shape[:2]
+
+        overlay_text = "overlay ON" if self.params["show_segmentations"] else "overlay OFF"
+
+        visible_ids = self.params.get("visible_label_ids", None)
+        if visible_ids is None:
+            selected_text = "all labels"
+        else:
+            selected_text = f"{len(visible_ids)} selected"
+        
+        self.status_label.setText(
+            f"Rendered on {self.device} | {w} x{h} | "
+            f"{elapsed: .3f} s | {overlay_text} | {selected_text}"
+        )
+
+    def on_render_error(self, error_text):
+        print(error_text)
+        self.status_label.setText("Render failed. see terminal for traceback,")
+
+    def on_render_finished(self):
+        self.render_running = False
+
+        if self.render_requested:
+            self.start_render()
+
+    def update_image_label(self, rgb):
+        h, w, c = rgb.shape
+
+        if c != 3:
+            raise ValueError(f"Expected RGB image with 3 channels, got {c} channels.")
+        
+        bytes_per_line = 3 * w
+
+        q_image = QImage(
+            rgb.data,
+            w,
+            h,
+            bytes_per_line,
+            QImage.Format_RGB888,
+        ).copy()
+        
+        pixmap = QPixmap.fromImage(q_image)
+
+        scaled = pixmap.scaled(
+            self.image_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+        self.image_label.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+        if self.current_rgb is not None:
+            self.update_image_display(self.current_rgb)
 
 def main():
     app = QApplication(sys.argv)

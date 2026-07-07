@@ -48,8 +48,13 @@ LABEL_PATH = Path(
 # Label mapping assigns labels to label IDs - this can be used to add the labels from 
 # other datasets which may have different names to all align to the same label name
 LABEL_MAPPING_CSV = Path(
-    r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\MT-Anatomy-Localisation-Project\metadata\totalsegmentator_label_mapping.csv"
+    r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\MT-Anatomy-Localisation-Project\metadata\topaneu_label_mapping.csv"
 )
+
+# Optional preset. This only controls what starts ticked when the app opens.
+# If the preset names are not found in the current CSV, the app will simply show all labels.
+# For other datasets, you can leave this as "totalsegmentator_vascular" or set it to "all".
+DEFAULT_SELECTION_PRESET = "totalsegmentator_vascular"  # options: "totalsegmentator_vascular", "all"
 
 # original will only tick these default labels then others can be be imposed when checked
 DEFAULT_VISIBLE_LABEL_NAMES = [
@@ -111,6 +116,48 @@ def default_visible_label_ids(label_name_to_id):
         if label_name in label_name_to_id:
             ids.append(label_name_to_id[label_name])
     return set(ids)
+
+def choose_starting_visible_label_ids(label_id_to_name, label_name_to_id):
+    """
+    Decide which labels are ticked when the app starts.
+
+    - If there is no CSV mapping, return None, meaning show all label channels.
+    - If DEFAULT_SELECTION_PRESET is "all", tick every label in the CSV.
+    - If the TotalSegmentator vascular preset matches this CSV, tick those labels.
+    - If the preset does not match this dataset, fall back to all labels instead of crashing.
+    """
+    if not label_id_to_name:
+        return None
+
+    if DEFAULT_SELECTION_PRESET.lower() == "all":
+        return set(label_id_to_name.keys())
+
+    preset_ids = default_visible_label_ids(label_name_to_id)
+
+    if preset_ids:
+        return preset_ids
+
+    print("No preset/default label names found in this mapping CSV; starting with all labels selected.")
+    return set(label_id_to_name.keys())
+
+
+def build_label_id_to_channel(label_id_to_name):
+    """
+    Map real label IDs from the CSV to nanoDRR label channel indices.
+
+    label_channels[0] is the first segmentation channel after the CT channel.
+    For normal labelmaps with IDs 1..N, this gives: 1->0, 2->1, 3->2, ...
+    For non-consecutive IDs, this uses sorted label IDs from the CSV.
+
+    Best practice: keep/remap each dataset labelmap to consecutive IDs 1..N.
+    """
+    if not label_id_to_name:
+        return None
+
+    return {
+        int(label_id): channel_idx
+        for channel_idx, label_id in enumerate(sorted(label_id_to_name.keys()))
+    }
 
 # ============================================================
 # nanoDRR helper functions - taken from original script
@@ -306,7 +353,8 @@ def dilate_mask(mask, iterations=1):
 def overlay_labels_channels_on_rgb(
         rgb,
         label_channels,
-        visible_label_ids = None,
+        visible_label_ids=None,
+        label_id_to_channel=None,
         fill_alpha=0.30,
         border_width=2,
         label_threshold=0.0,
@@ -327,7 +375,12 @@ def overlay_labels_channels_on_rgb(
 
     for label_id in visible_ids:
 
-        channel_idx = label_id - 1
+        if label_id_to_channel is None:
+            channel_idx = label_id - 1
+        else:
+            channel_idx = label_id_to_channel.get(label_id, None)
+            if channel_idx is None:
+                continue
 
         if channel_idx < 0 or channel_idx >= n_labels:
             continue
@@ -406,7 +459,8 @@ def render_pose_rgb(
             rgb = overlay_labels_channels_on_rgb(
                 rgb=rgb,
                 label_channels=label_channels,
-                visible_label_ids = visible_label_ids,
+                visible_label_ids=visible_label_ids,
+                label_id_to_channel=params.get("label_id_to_channel", None),
                 fill_alpha=float(params.get("fill_alpha", 0.30)),
                 border_width=int(params.get("border_width", 2)),
                 label_threshold=float(params.get("label_threshold", 0.0)),
@@ -547,15 +601,13 @@ class FluoroControlWindow(QMainWindow):
         self.current_rgb = None
 
         self.label_id_to_name, self.label_name_to_id = load_label_mapping()
+        self.label_id_to_channel = build_label_id_to_channel(self.label_id_to_name)
         self.label_checkboxes = {}
 
-        if self.label_id_to_name:
-            starting_visible_ids = default_visible_label_ids(self.label_name_to_id)
-
-            if not starting_visible_ids:
-                starting_visible_ids = set(self.label_id_to_name.key())
-        else:
-            starting_visible_ids = None
+        starting_visible_ids = choose_starting_visible_label_ids(
+            self.label_id_to_name,
+            self.label_name_to_id,
+        )
         
         self.params = {
             "rot_x": 0.0,
@@ -575,6 +627,7 @@ class FluoroControlWindow(QMainWindow):
             "border_width": 2,
             "label_threshold": 0.0,
             "visible_label_ids": starting_visible_ids,
+            "label_id_to_channel": self.label_id_to_channel,
         }
 
         self._load_subjects()
@@ -982,12 +1035,10 @@ class FluoroControlWindow(QMainWindow):
             self.request_render()
 
     def select_default_labels(self):
-        ids = default_visible_label_ids(self.label_name_to_id)
-
-        # if the default labels are not found in the mapping, fall back to all labels
-        if not ids:
-            ids = set(self.label_id_to_name.keys())
-        
+        ids = choose_starting_visible_label_ids(
+            self.label_id_to_name,
+            self.label_name_to_id,
+        )
         self.set_visible_labels(ids)
 
     def select_all_labels(self):

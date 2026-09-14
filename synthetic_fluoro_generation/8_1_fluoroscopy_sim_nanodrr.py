@@ -1,8 +1,11 @@
-from pathlib import Path
+import argparse
 import csv
+import json
+from pathlib import Path
 import sys
 import time
 import traceback
+import nibabel as nib
 import numpy as np
 import torch
 
@@ -47,7 +50,7 @@ LABEL_PATH = Path(
 
 # Label mapping assigns labels to label IDs - this can be used to add the labels from 
 # other datasets which may have different names to all align to the same label name
-LABEL_MAPPING_CSV = Path(
+LABEL_MAPPING_PATH = Path(
     r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\MT-Anatomy-Localisation-Project\metadata\totalsegmentator_label_mapping.csv"
 )
 
@@ -75,32 +78,48 @@ DEFAULT_VISIBLE_LABEL_NAMES = [
 # ============================================================
 # Label mapping helpers
 # ============================================================
-def load_label_mapping():
+def load_label_mapping(mapping_path):
     """
     assigned the label to the id and vice versa
     allows multiple datasets to be considered using the same script even if the names are written slightly different
     """
-    if not LABEL_MAPPING_CSV.exists():
-        print(f"Warning: label mapping CSV file not found at {LABEL_MAPPING_CSV}.")
+    if mapping_path is None:
+        return {}, {}
+    mapping_path = Path(mapping_path)
+    if not mapping_path.exists():
+        print(f"Warning: label mapping file not found at {mapping_path}.")
         print("segmentations can still be seen but individual label selection will be unavailable")
         return {}, {}
 
     label_id_to_name = {}
 
-    with open(LABEL_MAPPING_CSV, "r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
+    if mapping_path.suffix.lower() == ".json":
+        with mapping_path.open("r", encoding="utf-8-sig") as f:
+            payload = json.load(f)
+        labels = payload.get("labels", payload)
+        if not isinstance(labels, dict):
+            raise ValueError("JSON mapping must contain an object named 'labels'.")
+        for label_name, label_id in labels.items():
+            label_id = int(label_id)
+            if label_id > 0:
+                label_id_to_name[label_id] = str(label_name).strip()
+    elif mapping_path.suffix.lower() == ".csv":
+        with mapping_path.open("r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
 
-        required = {"label_name", "label_id"}
-        if not required.issubset(set(reader.fieldnames or [])):
-            raise ValueError(
-                f"Mapping CSV must contain columns {required}."
-                f"Found columns: {reader.fieldnames}"
-            )
-        
-        for row in reader:
-            label_name = str(row["label_name"])
-            label_id = int(row["label_id"])
-            label_id_to_name[label_id] = label_name
+            required = {"label_name", "label_id"}
+            if not required.issubset(set(reader.fieldnames or [])):
+                raise ValueError(
+                    f"Mapping CSV must contain columns {required}."
+                    f"Found columns: {reader.fieldnames}"
+                )
+            for row in reader:
+                label_name = str(row["label_name"]).strip()
+                label_id = int(row["label_id"])
+                if label_id > 0:
+                    label_id_to_name[label_id] = label_name
+    else:
+        raise ValueError("Label mapping must be a .json or .csv file.")
     
     label_name_to_id = {
         label_name: label_id
@@ -137,7 +156,7 @@ def choose_starting_visible_label_ids(label_id_to_name, label_name_to_id):
     if preset_ids:
         return preset_ids
 
-    print("No preset/default label names found in this mapping CSV; starting with all labels selected.")
+    print("No preset/default label names found in this mapping; starting with all labels selected.")
     return set(label_id_to_name.keys())
 
 
@@ -155,8 +174,9 @@ def build_label_id_to_channel(label_id_to_name):
         return None
 
     return {
-        int(label_id): channel_idx
-        for channel_idx, label_id in enumerate(sorted(label_id_to_name.keys()))
+        int(label_id): int(label_id) - 1
+        for label_id in label_id_to_name
+        if int(label_id) > 0
     }
 
 # ============================================================
@@ -166,7 +186,8 @@ def normalise_for_display(img_2d):
     img_2d = img_2d.astype(np.float32)
 
     low = np.percentile(img_2d, 1)
-    high = np.percentile(img_2d, 99)
+    # Match the robust display window used by the DeepDRR comparison GUI.
+    high = np.percentile(img_2d, 99.5)
 
     img_2d = (img_2d - low) / (high - low + 1e-8)
     img_2d = np.clip(img_2d, 0, 1)
@@ -441,6 +462,9 @@ def render_pose_rgb(
         width=width
     )
 
+    if bool(params.get("invert", True)):
+        ct_np = 1.0 - ct_np
+
     rgb = greyscale_to_rgb_uint8(ct_np)
 
     if params.get("show_segmentations", False):
@@ -579,7 +603,7 @@ class RenderWorker(QRunnable):
 # ============================================================
 
 class FluoroControlWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, image_path, label_path, mapping_path):
         super().__init__()
 
         self.setWindowTitle("nanoDRR Fluoroscopy Simulator: C-Arm Control")
@@ -587,8 +611,9 @@ class FluoroControlWindow(QMainWindow):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.image_path = IMAGE_PATH
-        self.label_path = LABEL_PATH
+        self.image_path = image_path
+        self.label_path = label_path
+        self.mapping_path = mapping_path
 
         self.subject_ct = None
         self.subject_labels = None
@@ -600,7 +625,7 @@ class FluoroControlWindow(QMainWindow):
 
         self.current_rgb = None
 
-        self.label_id_to_name, self.label_name_to_id = load_label_mapping()
+        self.label_id_to_name, self.label_name_to_id = load_label_mapping(self.mapping_path)
         self.label_id_to_channel = build_label_id_to_channel(self.label_id_to_name)
         self.label_checkboxes = {}
 
@@ -617,9 +642,10 @@ class FluoroControlWindow(QMainWindow):
             "trans_y": 850.0,
             "trans_z": 0.0,
             "sdd": 1020.0,
-            "pixel_size": 2.0,
-            "height": 256,
-            "width": 256,
+            # Match the DeepDRR comparison defaults.
+            "pixel_size": 0.6,
+            "height": 512,
+            "width": 512,
 
             # Segmentation overlay settings
             "show_segmentations": False,
@@ -628,6 +654,8 @@ class FluoroControlWindow(QMainWindow):
             "label_threshold": 0.0,
             "visible_label_ids": starting_visible_ids,
             "label_id_to_channel": self.label_id_to_channel,
+
+            "invert": True,
         }
 
         self._load_subjects()
@@ -656,6 +684,41 @@ class FluoroControlWindow(QMainWindow):
                 str(self.image_path),
                 str(self.label_path),
             ).to(self.device)
+
+            # nanoDRR creates segmentation channels in sorted order of labels
+            # that are actually present.  Filtering here prevents a missing
+            # vessel ID from shifting every later label/colour association.
+            if self.label_path.name.endswith((".nii", ".nii.gz")):
+                label_values = np.asarray(nib.load(str(self.label_path)).dataobj)
+                rounded = np.rint(label_values)
+                if not np.allclose(label_values, rounded, atol=1e-4, rtol=0.0):
+                    raise ValueError("The segmentation contains non-integer label values.")
+                present_ids = sorted(int(x) for x in np.unique(rounded) if int(x) > 0)
+                if self.label_id_to_name:
+                    self.label_id_to_name = {
+                        label_id: self.label_id_to_name.get(label_id, f"label_{label_id}")
+                        for label_id in present_ids
+                    }
+                    self.label_name_to_id = {
+                        name: label_id for label_id, name in self.label_id_to_name.items()
+                    }
+                else:
+                    self.label_id_to_name = {
+                        label_id: f"label_{label_id}" for label_id in present_ids
+                    }
+                    self.label_name_to_id = {
+                        name: label_id for label_id, name in self.label_id_to_name.items()
+                    }
+                self.label_id_to_channel = {
+                    label_id: label_id -1
+                    for label_id in present_ids
+                    }
+                self.params["label_id_to_channel"] = self.label_id_to_channel
+                visible = self.params.get("visible_label_ids")
+                if visible is None:
+                    self.params["visible_label_ids"] = set(present_ids)
+                else:
+                    self.params["visible_label_ids"] = set(visible) & set(present_ids)
 
             print("Loaded CT subject")
             print("Loaded label subject")
@@ -708,17 +771,23 @@ class FluoroControlWindow(QMainWindow):
 
         self.image_path_edit = QLineEdit(str(self.image_path))
         self.label_path_edit = QLineEdit("" if self.label_path is None else str(self.label_path))
+        self.mapping_path_edit = QLineEdit(
+            "" if self.mapping_path is None else str(self.mapping_path)
+        )
 
         self.image_path_edit.setReadOnly(True)
         self.label_path_edit.setReadOnly(True)
+        self.mapping_path_edit.setReadOnly(True)
 
         browse_image_button = QPushButton("Browse CT Image")
         browse_label_button = QPushButton("Browse Segmentations")
+        browse_mapping_button = QPushButton("Browse vessel mapping")
         clear_label_button = QPushButton("Clear Segmentations")
         reload_files_button = QPushButton("Load selected files")
 
         browse_image_button.clicked.connect(self.browse_image_file)
         browse_label_button.clicked.connect(self.browse_label_file)
+        browse_mapping_button.clicked.connect(self.browse_mapping_file)
         clear_label_button.clicked.connect(self.clear_label_file)
         reload_files_button.clicked.connect(self.reload_selected_files)
 
@@ -730,6 +799,10 @@ class FluoroControlWindow(QMainWindow):
         file_layout.addWidget(self.label_path_edit)
         file_layout.addWidget(browse_label_button)
         file_layout.addWidget(clear_label_button)
+
+        file_layout.addWidget(QLabel("Vessel label mapping JSON/CSV:"))
+        file_layout.addWidget(self.mapping_path_edit)
+        file_layout.addWidget(browse_mapping_button)
 
         file_layout.addWidget(reload_files_button)
 
@@ -765,63 +838,42 @@ class FluoroControlWindow(QMainWindow):
         seg_layout.addWidget(QLabel("Border width"))
         seg_layout.addWidget(self.border_width_box)
 
-        if self.label_id_to_name:
-            label_buttons = QHBoxLayout()
+        label_buttons = QHBoxLayout()
+        select_defaults_button = QPushButton("Vascular defaults")
+        select_all_button = QPushButton("All")
+        clear_all_button = QPushButton("None")
+        select_defaults_button.clicked.connect(self.select_default_labels)
+        select_all_button.clicked.connect(self.select_all_labels)
+        clear_all_button.clicked.connect(self.clear_all_labels)
+        label_buttons.addWidget(select_defaults_button)
+        label_buttons.addWidget(select_all_button)
+        label_buttons.addWidget(clear_all_button)
+        seg_layout.addLayout(label_buttons)
 
-            select_defaults_button = QPushButton("Vascular defaults")
-            select_all_button = QPushButton("All")
-            clear_all_button = QPushButton("None")
-
-            select_defaults_button.clicked.connect(self.select_default_labels)
-            select_all_button.clicked.connect(self.select_all_labels)
-            clear_all_button.clicked.connect(self.clear_all_labels)
-
-            label_buttons.addWidget(select_defaults_button)
-            label_buttons.addWidget(select_all_button)
-            label_buttons.addWidget(clear_all_button)
-
-            seg_layout.addLayout(label_buttons)
-
-            label_scroll = QScrollArea()
-            label_scroll.setWidgetResizable(True)
-            label_scroll.setFixedHeight(220)
-
-            label_widget = QWidget()
-            label_list_layout = QVBoxLayout()
-            label_widget.setLayout(label_list_layout)
-
-            visible_ids = self.params.get("visible_label_ids", set())
-
-            for label_id, label_name in sorted(
-                self.label_id_to_name.items(),
-                key=lambda item: item[1].lower(),
-            ):
-                checkbox = QCheckBox(f"{label_name} [ID {label_id}]")
-
-                if visible_ids is None:
-                    checkbox.setChecked(True)
-                else:
-                    checkbox.setChecked(label_id in visible_ids)
-                
-                checkbox.toggled.connect(
-                    lambda checked, lid=label_id: self.on_label_checkbox_toggled(lid, checked)
-                )
-
-                self.label_checkboxes[label_id] = checkbox
-                label_list_layout.addWidget(checkbox)
-
-            label_list_layout.addStretch()
-            label_scroll.setWidget(label_widget)
-
-            seg_layout.addWidget(QLabel("Visible labels"))
-            seg_layout.addWidget(label_scroll)
-        else:
-            seg_layout.addWidget(
-                QLabel("No label mapping available. Individual label selection is disabled.\n"
-                       "Overlay will show all labels if segmentation is imposed.")
-            )
+        label_scroll = QScrollArea()
+        label_scroll.setWidgetResizable(True)
+        label_scroll.setFixedHeight(220)
+        label_widget = QWidget()
+        self.label_list_layout = QVBoxLayout(label_widget)
+        label_scroll.setWidget(label_widget)
+        seg_layout.addWidget(QLabel("Visible labels"))
+        seg_layout.addWidget(label_scroll)
+        self._rebuild_label_list()
         
         layout.addWidget(seg_group)
+
+        # Fluoroscopy display settings
+        display_group = QGroupBox("Display")
+        display_layout = QVBoxLayout()
+        display_group.setLayout(display_layout)
+
+        self.invert_checkbox = QCheckBox("Invert fluoroscopy-style display")
+        self.invert_checkbox.setChecked(bool(self.params["invert"]))
+        self.invert_checkbox.toggled.connect(self.set_invert_display)
+
+        display_layout.addWidget(self.invert_checkbox)
+        layout.addWidget(display_group)
+
         pose_group = QGroupBox("C-Arm Pose Controls")
         pose_layout = QVBoxLayout()
         pose_group.setLayout(pose_layout)
@@ -923,7 +975,29 @@ class FluoroControlWindow(QMainWindow):
 
         layout.addWidget(self.image_label, stretch=1)
 
+        save_button = QPushButton("Save displayed image as PNG")
+        save_button.clicked.connect(self.save_current_image)
+        layout.addWidget(save_button)
+
         return panel
+
+    def save_current_image(self):
+        if self.current_rgb is None:
+            QMessageBox.information(self, "Nothing to save", "Render an image first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save simulated fluoroscopy", "nanodrr_fluoroscopy.png", "PNG (*.png)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        h, w, _ = self.current_rgb.shape
+        image = QImage(
+            self.current_rgb.data, w, h, 3 * w, QImage.Format_RGB888
+        ).copy()
+        if not image.save(path, "PNG"):
+            QMessageBox.critical(self, "Save failed", f"Could not save {path}")
 
     def browse_image_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -950,6 +1024,45 @@ class FluoroControlWindow(QMainWindow):
         if file_path:
             self.label_path = Path(file_path)
             self.label_path_edit.setText(str(self.label_path))
+
+    def browse_mapping_file(self):
+        start_dir = self.mapping_path.parent if self.mapping_path else Path.home()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select vessel label mapping",
+            str(start_dir),
+            "Label mappings (*.json *.csv);;JSON (*.json);;CSV (*.csv)",
+        )
+        if file_path:
+            self.mapping_path = Path(file_path)
+            self.mapping_path_edit.setText(str(self.mapping_path))
+
+    def _rebuild_label_list(self):
+        while self.label_list_layout.count():
+            item = self.label_list_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.label_checkboxes.clear()
+        visible_ids = self.params.get("visible_label_ids")
+        if not self.label_id_to_name:
+            message = QLabel(
+                "No label mapping is loaded. Load vessel_mapping.json and click "
+                "'Load selected files'."
+            )
+            message.setWordWrap(True)
+            self.label_list_layout.addWidget(message)
+        else:
+            for label_id, label_name in sorted(
+                self.label_id_to_name.items(), key=lambda item: item[1].lower()
+            ):
+                checkbox = QCheckBox(f"{label_name} [ID {label_id}]")
+                checkbox.setChecked(visible_ids is None or label_id in visible_ids)
+                checkbox.toggled.connect(
+                    lambda checked, lid=label_id: self.on_label_checkbox_toggled(lid, checked)
+                )
+                self.label_checkboxes[label_id] = checkbox
+                self.label_list_layout.addWidget(checkbox)
+        self.label_list_layout.addStretch()
         
 
     def clear_label_file(self):
@@ -961,7 +1074,14 @@ class FluoroControlWindow(QMainWindow):
             self.status_label.setText("Loading selected files...")
             QApplication.processEvents()
 
+            self.label_id_to_name, self.label_name_to_id = load_label_mapping(
+                self.mapping_path
+            )
+            self.params["visible_label_ids"] = choose_starting_visible_label_ids(
+                self.label_id_to_name, self.label_name_to_id
+            )
             self._load_subjects()
+            self._rebuild_label_list()
 
             if self.subject_labels is None:
                 self.seg_button.setChecked(False)
@@ -1055,6 +1175,10 @@ class FluoroControlWindow(QMainWindow):
         else:
             self.seg_button.setText("Impose Segmentations")
         
+        self.request_render()
+
+    def set_invert_display(self, checked):
+        self.params["invert"] = bool(checked)
         self.request_render()
 
     def reset_pose(self):
@@ -1183,12 +1307,26 @@ class FluoroControlWindow(QMainWindow):
         super().resizeEvent(event)
 
         if self.current_rgb is not None:
-            self.update_image_display(self.current_rgb)
+            self.update_image_label(self.current_rgb)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Interactive nanoDRR vessel comparison simulator")
+    parser.add_argument("--ct", type=Path, default=IMAGE_PATH, help="CT/CTA or enhanced NIfTI")
+    parser.add_argument("--labels", type=Path, default=LABEL_PATH, help="Vessel label-map NIfTI")
+    parser.add_argument(
+        "--mapping",
+        type=Path,
+        default=LABEL_MAPPING_PATH,
+        help="vessel_mapping.json or label_name/label_id CSV",
+    )
+    return parser.parse_args()
+
 
 def main():
+    args = parse_args()
     app = QApplication(sys.argv)
 
-    window = FluoroControlWindow()
+    window = FluoroControlWindow(args.ct, args.labels, args.mapping)
     window.show()
 
     sys.exit(app.exec())

@@ -1,422 +1,272 @@
 #!/usr/bin/env python3
-"""Register CT to aligned CTA, standardise the grid, and apply one fixed crop.
+"""Step 4/5: CT -> original CTA (Elastix) -> template CTA (saved Step 3 transform).
 
-The fixed CTA must already be aligned to the common template by Step 3. Elastix
-rigidly registers the CT to that CTA. The fitted rigid transform is also applied
-to the CT brain mask with nearest-neighbour interpolation. All four volumes are
-then placed on the fixed CTA grid. The permanent template brain mask determines
-the crop centre, while the template patient's original LPS CT determines the
-exact output voxel dimensions.
+The Step 3 SimpleITK transform MUST be the transform returned by the CTA-to-template
+registration and used in sitk.Resample(moving_CTA, template_CTA, transform, ...).
+It maps template/output physical points to original CTA/input physical points.
 
-Only the four ready-to-use NIfTI files are retained. Elastix's internal result,
-transform-parameter, and log files are created in a temporary directory.
+Inputs: original-space LPS CT/CTA and their brain masks; aligned CTA/mask from Step 3;
+Step 3 .tfm; permanent template mask and desired crop-size reference CT.
+Outputs: four cropped, grid-matched ready volumes plus Elastix parameters.
 """
-
 from __future__ import annotations
 
 import argparse
+import faulthandler
+faulthandler.enable()
+import shutil
 import tempfile
 from pathlib import Path
-from typing import Sequence
 
 import itk
 import numpy as np
 import SimpleITK as sitk
 
-
 OUTPUT_NAMES = {
-    "ct": "9_ready_CT.nii.gz",
-    "cta": "10_ready_CTA.nii.gz",
-    "ct_mask": "11_ready_CT_brain_mask.nii.gz",
-    "cta_mask": "12_ready_CTA_brain_mask.nii.gz",
+    'ct': '9_ready_CT.nii.gz',
+    'cta': '10_ready_CTA.nii.gz',
+    'ct_mask': '11_ready_CT_brain_mask.nii.gz',
+    'cta_mask': '12_ready_CTA_brain_mask.nii.gz',
 }
 
 
-def existing_file(path: Path, description: str) -> Path:
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--ct', type=Path, required=True, help='3_CT_LPS.nii.gz')
+    parser.add_argument('--ct-mask', type=Path, required=True, help='5_CT_LPS_brain_mask.nii.gz')
+    parser.add_argument('--original-cta', type=Path, required=True, help='4_CTA_LPS.nii.gz (Elastix fixed)')
+    parser.add_argument('--original-cta-mask', type=Path, required=True, help='6_CTA_LPS_brain_mask.nii.gz')
+    parser.add_argument('--aligned-cta', type=Path, required=True, help='7_Aligned_CTA.nii.gz (template grid)')
+    parser.add_argument('--aligned-cta-mask', type=Path, required=True, help='8_Aligned_CTA_brain_mask.nii.gz')
+    parser.add_argument('--cta-to-template-transform', type=Path, required=True, help='Saved SimpleITK Step 3 transform .tfm')
+    parser.add_argument('--crop-reference-mask', type=Path, required=True, help='Permanent template patient brain mask on aligned CTA grid')
+    parser.add_argument('--crop-size-reference-ct', type=Path, required=True, help='Reference CT whose voxel dimensions define the crop size')
+    parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--initialization', choices=['header', 'center-of-gravity', 'geometrical-center'], default='header')
+    parser.add_argument('--overwrite', action='store_true')
+    return parser.parse_args()
+
+
+def require(path, label):
     if not path.is_file():
-        raise FileNotFoundError(f"{description} was not found: {path}")
+        raise FileNotFoundError(f'{label}: {path}')
     return path
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Rigidly register CT to an aligned CTA, transform both brain "
-            "masks, place everything on the template grid, and apply one "
-            "template-derived crop."
-        )
-    )
-    parser.add_argument(
-        "--cta",
-        required=True,
-        type=Path,
-        help="Fixed template-aligned CTA from Step 3",
-    )
-    parser.add_argument(
-        "--ct",
-        required=True,
-        type=Path,
-        help="Moving LPS CT",
-    )
-    parser.add_argument(
-        "--cta-mask",
-        required=True,
-        type=Path,
-        help="Brain mask on the fixed aligned-CTA grid",
-    )
-    parser.add_argument(
-        "--ct-mask",
-        required=True,
-        type=Path,
-        help="Brain mask on the moving CT grid",
-    )
-    parser.add_argument(
-        "--crop-reference-mask",
-        required=True,
-        type=Path,
-        help=(
-            "Permanent brain mask from the first/template patient. Use this "
-            "same file for every patient."
-        ),
-    )
-    parser.add_argument(
-        "--output-dir",
-        required=True,
-        type=Path,
-        help="Patient directory for the four ready output files",
-    )
-    parser.add_argument(
-        "--crop-size-reference-ct",
-        required=True,
-        type=Path,
-        help=(
-            "Permanent original LPS CT from the first/template patient. Its "
-            "voxel dimensions define the output crop size for every patient."
-        ),
-    )
-    parser.add_argument(
-        "--initialization",
-        choices=("header", "center-of-gravity", "geometrical-center"),
-        default="header",
-        help=(
-            "Initial alignment. Use 'header' when paired CT/CTA physical "
-            "headers already correspond (default)."
-        ),
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace existing ready output files",
-    )
-    return parser.parse_args(argv)
+def same_grid(a, b):
+    return (a.GetDimension() == b.GetDimension() == 3 and
+            a.GetSize() == b.GetSize() and
+            np.allclose(a.GetSpacing(), b.GetSpacing(), atol=1e-5, rtol=0) and
+            np.allclose(a.GetOrigin(), b.GetOrigin(), atol=1e-4, rtol=0) and
+            np.allclose(a.GetDirection(), b.GetDirection(), atol=1e-6, rtol=0))
 
 
-def same_grid(first: sitk.Image, second: sitk.Image) -> bool:
-    return (
-        first.GetDimension() == second.GetDimension() == 3
-        and first.GetSize() == second.GetSize()
-        and np.allclose(first.GetSpacing(), second.GetSpacing(), atol=1e-5, rtol=0.0)
-        and np.allclose(first.GetOrigin(), second.GetOrigin(), atol=1e-4, rtol=0.0)
-        and np.allclose(
-            first.GetDirection(), second.GetDirection(), atol=1e-6, rtol=0.0
-        )
-    )
+def require_grid(a, b, label_a, label_b):
+    if not same_grid(a, b):
+        raise ValueError(f'{label_a} and {label_b} must occupy the same grid (size/spacing/origin/direction).')
 
 
-def assert_same_grid(
-    first: sitk.Image,
-    second: sitk.Image,
-    first_name: str,
-    second_name: str,
-) -> None:
-    if not same_grid(first, second):
-        raise ValueError(
-            f"{first_name} and {second_name} do not occupy the same physical "
-            "grid. Check their size, spacing, origin, and direction."
-        )
-
-
-def binary_mask(mask: sitk.Image, name: str) -> sitk.Image:
+def binary_mask(mask):
     result = sitk.Cast(mask > 0, sitk.sitkUInt8)
-    count = int(np.count_nonzero(sitk.GetArrayViewFromImage(result)))
-    if count == 0:
-        raise ValueError(f"{name} is empty.")
+    if not np.any(sitk.GetArrayViewFromImage(result)):
+        raise ValueError('Brain mask is empty')
     return result
 
 
-def crop_region_from_template_mask(
-    template_mask: sitk.Image,
-    target_size_xyz: Sequence[int],
-) -> tuple[list[int], list[int]]:
-    """Centre a fixed-size crop on the template brain-mask bounding box."""
-    mask_array = sitk.GetArrayViewFromImage(template_mask) > 0
-    coordinates_zyx = np.argwhere(mask_array)
-    if coordinates_zyx.size == 0:
-        raise ValueError("The crop-reference brain mask is empty.")
+def crop_region(template_mask, target_size):
+    """Find a bounded fixed crop without temporary-image dangling views.
 
-    minimum_xyz = coordinates_zyx.min(axis=0)[::-1].astype(np.int64)
-    maximum_xyz = (coordinates_zyx.max(axis=0)[::-1] + 1).astype(np.int64)
-    image_size_xyz = np.asarray(template_mask.GetSize(), dtype=np.int64)
-    target_size_xyz = np.asarray(target_size_xyz, dtype=np.int64)
+    NumPy uses ZYX index order; SimpleITK GetSize uses XYZ.
+    Hold the image and its array copy for the entire calculation.
+    """
+    stable_mask = binary_mask(template_mask)
+    voxels = sitk.GetArrayFromImage(stable_mask) > 0  # owning copy
+    if not voxels.any():
+        raise ValueError('Template crop-reference brain mask is empty')
 
-    if target_size_xyz.shape != (3,) or np.any(target_size_xyz <= 0):
-        raise ValueError(f"Invalid crop size: {tuple(target_size_xyz)}")
-    if np.any(target_size_xyz > image_size_xyz):
-        raise ValueError(
-            "The requested original-CT crop size is larger than the template "
-            f"grid. Crop size={tuple(target_size_xyz)}; template "
-            f"size={tuple(image_size_xyz)}."
-        )
+    # Determine bounding coordinates without allocating an N x 3
+    # array for millions of foreground voxels.
+    z = np.flatnonzero(np.any(voxels, axis=(1, 2)))
+    y = np.flatnonzero(np.any(voxels, axis=(0, 2)))
+    x = np.flatnonzero(np.any(voxels, axis=(0, 1)))
+    lo = np.array([x[0], y[0], z[0]], dtype=np.int64)
+    hi = np.array([x[-1], y[-1], z[-1]], dtype=np.int64)
+    del voxels
 
-    brain_centre_xyz = (minimum_xyz + maximum_xyz - 1) / 2.0
-    start_xyz = np.floor(brain_centre_xyz - (target_size_xyz - 1) / 2.0).astype(
-        np.int64
-    )
-
-    # Shift the crop back inside the image when the centred region would cross
-    # a template boundary, while preserving the requested dimensions exactly.
-    maximum_start_xyz = image_size_xyz - target_size_xyz
-    start_xyz = np.minimum(np.maximum(start_xyz, 0), maximum_start_xyz)
-
-    return start_xyz.astype(int).tolist(), target_size_xyz.astype(int).tolist()
+    size = np.asarray(target_size, dtype=np.int64)
+    bounds = np.asarray(template_mask.GetSize(), dtype=np.int64)
+    if size.shape != (3,) or np.any(size <= 0) or np.any(size > bounds):
+        raise ValueError(f'Requested crop {tuple(size)} exceeds template grid {tuple(bounds)}')
+    center = (lo.astype(float) + hi.astype(float)) / 2.0
+    start = np.floor(center - (size - 1) / 2.0).astype(np.int64)
+    start = np.minimum(np.maximum(start, 0), bounds - size)
+    return start.tolist(), size.tolist()
 
 
-def resample_to_reference(
-    image: sitk.Image,
-    reference: sitk.Image,
-    *,
-    is_mask: bool,
-) -> sitk.Image:
-    if is_mask:
-        image = binary_mask(image, "Resampled mask input")
-        interpolator = sitk.sitkNearestNeighbor
-        default_value = 0.0
-        output_type = sitk.sitkUInt8
+def elastix_parameters(initialization):
+    p = itk.ParameterObject.GetDefaultParameterMap('rigid')
+    if initialization == 'header':
+        p['AutomaticTransformInitialization'] = ['false']
     else:
-        image = sitk.Cast(image, sitk.sitkFloat32)
-        interpolator = sitk.sitkLinear
-        default_value = -1024.0
-        output_type = sitk.sitkFloat32
-
-    identity = sitk.Transform(3, sitk.sitkIdentity)
-    return sitk.Resample(
-        image,
-        reference,
-        identity,
-        interpolator,
-        default_value,
-        output_type,
-    )
-
-
-def crop_image(image: sitk.Image, index: list[int], size: list[int]) -> sitk.Image:
-    return sitk.RegionOfInterest(image, size=size, index=index)
+        p['AutomaticTransformInitialization'] = ['true']
+        p['AutomaticTransformInitializationMethod'] = [
+            'CenterOfGravity' if initialization == 'center-of-gravity' else 'GeometricalCenter'
+        ]
+    p['NumberOfResolutions'] = ['4']
+    p['MaximumNumberOfIterations'] = ['750']
+    p['NumberOfSpatialSamples'] = ['16000']
+    p['NumberOfHistogramBins'] = ['64']
+    p['ImageSampler'] = ['RandomSparseMask']
+    p['MaximumNumberOfSamplingAttempts'] = ['0']
+    p['FinalBSplineInterpolationOrder'] = ['1']
+    p['DefaultPixelValue'] = ['-1024']
+    p['ResultImagePixelType'] = ['float']
+    obj = itk.ParameterObject.New()
+    obj.SetParameterMap(p)
+    return obj
 
 
-def mask_transform_parameters(
-    registration_parameters: itk.ParameterObject,
-) -> itk.ParameterObject:
-    """Copy the fitted rigid transform and configure label-safe resampling."""
-    parameter_map = registration_parameters.GetParameterMap(0)
-    parameter_map["FinalBSplineInterpolationOrder"] = ["0"]
-    parameter_map["DefaultPixelValue"] = ["0"]
-    parameter_map["ResultImagePixelType"] = ["unsigned char"]
-
-    result = itk.ParameterObject.New()
-    result.SetParameterMap(parameter_map)
-    return result
+def mask_parameters(fitted):
+    m = dict(fitted.GetParameterMap(0))
+    m['FinalBSplineInterpolationOrder'] = ['0']
+    m['DefaultPixelValue'] = ['0']
+    m['ResultImagePixelType'] = ['unsigned char']
+    obj = itk.ParameterObject.New()
+    obj.SetParameterMap(m)
+    return obj
 
 
-def check_outputs(output_paths: dict[str, Path], overwrite: bool) -> None:
-    existing = [path for path in output_paths.values() if path.exists()]
-    if existing and not overwrite:
-        listing = "\n".join(f"  {path}" for path in existing)
-        raise FileExistsError(
-            "The following outputs already exist:\n"
-            f"{listing}\nUse --overwrite to replace all ready outputs."
-        )
-
-
-def make_registration_parameters(initialization: str) -> itk.ParameterObject:
-    parameter_map = itk.ParameterObject.GetDefaultParameterMap("rigid")
-
-    if initialization == "header":
-        parameter_map["AutomaticTransformInitialization"] = ["false"]
-    else:
-        method = {
-            "center-of-gravity": "CenterOfGravity",
-            "geometrical-center": "GeometricalCenter",
-        }[initialization]
-        parameter_map["AutomaticTransformInitialization"] = ["true"]
-        parameter_map["AutomaticTransformInitializationMethod"] = [method]
-
-    parameter_map["NumberOfResolutions"] = ["4"]
-    parameter_map["MaximumNumberOfIterations"] = ["750"]
-    parameter_map["NumberOfSpatialSamples"] = ["16000"]
-    parameter_map["NumberOfHistogramBins"] = ["64"]
-    parameter_map["ImageSampler"] = ["RandomSparseMask"]
-    parameter_map["MaximumNumberOfSamplingAttempts"] = ["0"]
-    parameter_map["FinalBSplineInterpolationOrder"] = ["1"]
-    parameter_map["DefaultPixelValue"] = ["-1024"]
-    parameter_map["ResultImagePixelType"] = ["float"]
-
-    parameter_object = itk.ParameterObject.New()
-    parameter_object.SetParameterMap(parameter_map)
-    return parameter_object
-
-
-def main(argv: Sequence[str] | None = None) -> None:
-    args = parse_args(argv)
-
-    cta_path = existing_file(args.cta, "Fixed aligned CTA")
-    ct_path = existing_file(args.ct, "Moving CT")
-    cta_mask_path = existing_file(args.cta_mask, "Aligned CTA brain mask")
-    ct_mask_path = existing_file(args.ct_mask, "CT brain mask")
-    crop_reference_path = existing_file(
-        args.crop_reference_mask,
-        "Permanent template crop-reference mask",
-    )
-    crop_size_reference_path = existing_file(
-        args.crop_size_reference_ct,
-        "Permanent template original CT used for crop size",
-    )
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_paths = {
-        key: args.output_dir / filename for key, filename in OUTPUT_NAMES.items()
+def main():
+    print('[DEBUG] Main started', flush=True)
+    args = parse_args()
+    print('[DEBUG] Arguments parsed', flush=True)
+    files = {
+        'CT': args.ct, 'CT mask': args.ct_mask,
+        'Original CTA': args.original_cta, 'Original CTA mask': args.original_cta_mask,
+        'Aligned CTA': args.aligned_cta, 'Aligned CTA mask': args.aligned_cta_mask,
+        'Step 3 transform': args.cta_to_template_transform,
+        'Template crop mask': args.crop_reference_mask,
+        'Crop size reference CT': args.crop_size_reference_ct,
     }
-    check_outputs(output_paths, args.overwrite)
+    for label, path in files.items():
+        print(f'[DEBUG] Checking {label}: {path}', flush=True)
+        require(path, label)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {key: args.output_dir / name for key, name in OUTPUT_NAMES.items()}
+    elastix_file = args.output_dir / 'CT_to_original_CTA_ElastixTransformParameters.txt'
+    conflicts = [p for p in [*outputs.values(), elastix_file] if p.exists()]
+    if conflicts and not args.overwrite:
+        raise FileExistsError('Outputs exist; use --overwrite to replace:\n' + '\n'.join(map(str, conflicts)))
 
-    print("Combined CT registration and fixed-template preparation")
-    print(f"Fixed aligned CTA:      {cta_path}")
-    print(f"Moving CT:              {ct_path}")
-    print(f"Aligned CTA mask:       {cta_mask_path}")
-    print(f"Moving CT mask:         {ct_mask_path}")
-    print(f"Template crop mask:     {crop_reference_path}")
-    print(f"Crop-size reference CT: {crop_size_reference_path}")
-    print(f"Registration initialisation: {args.initialization}")
+    print('[DEBUG] Loading CT...', flush=True)
+    ct = sitk.ReadImage(str(args.ct))
+    print('[DEBUG] Loaded CT', flush=True)
+    print('[DEBUG] Loading CT mask...', flush=True)
+    ct_mask = binary_mask(sitk.ReadImage(str(args.ct_mask)))
+    print('[DEBUG] Loaded CT mask', flush=True)
+    print('[DEBUG] Loading Original CTA...', flush=True)
+    original_cta = sitk.ReadImage(str(args.original_cta))
+    print('[DEBUG] Loaded Original CTA', flush=True)
+    print('[DEBUG] Loading Original CTA mask...', flush=True)
+    original_mask = binary_mask(sitk.ReadImage(str(args.original_cta_mask)))
+    print('[DEBUG] Loaded Original CTA mask', flush=True)
+    print('[DEBUG] Loading Aligned CTA...', flush=True)
+    aligned_cta = sitk.ReadImage(str(args.aligned_cta))
+    print('[DEBUG] Loaded Aligned CTA', flush=True)
+    print('[DEBUG] Loading Aligned CTA mask...', flush=True)
+    aligned_mask = binary_mask(sitk.ReadImage(str(args.aligned_cta_mask)))
+    print('[DEBUG] Loaded Aligned CTA mask', flush=True)
+    print('[DEBUG] Loading Template mask...', flush=True)
+    reference_mask = sitk.ReadImage(str(args.crop_reference_mask))
+    print('[DEBUG] Loaded Template mask', flush=True)
+    print('[DEBUG] Loading Template CT...', flush=True)
+    reference_ct = sitk.ReadImage(str(args.crop_size_reference_ct))
+    print('[DEBUG] Loaded Template CT', flush=True)
 
-    # Validate source image/mask pairs before starting the expensive step.
-    fixed_cta_sitk = sitk.ReadImage(str(cta_path))
-    fixed_cta_mask_sitk = sitk.ReadImage(str(cta_mask_path))
-    moving_ct_sitk = sitk.ReadImage(str(ct_path))
-    moving_ct_mask_sitk = sitk.ReadImage(str(ct_mask_path))
-    crop_reference_mask = sitk.ReadImage(str(crop_reference_path))
-    crop_size_reference_ct = sitk.ReadImage(str(crop_size_reference_path))
-    if crop_size_reference_ct.GetDimension() != 3:
-        raise ValueError("The crop-size reference CT must be 3-D.")
+    print('[DEBUG] Checking grids...', flush=True)
+    require_grid(ct, ct_mask, 'CT', 'CT brain mask')
+    require_grid(original_cta, original_mask, 'Original CTA', 'Original CTA brain mask')
+    require_grid(aligned_cta, aligned_mask, 'Aligned CTA', 'Aligned CTA brain mask')
+    require_grid(aligned_cta, reference_mask, 'Aligned CTA', 'Template crop mask')
+    if reference_ct.GetDimension() != 3:
+        raise ValueError('Crop-size reference CT must be 3D')
+    print('[DEBUG] Calculating crop...', flush=True)
+    crop_start, crop_size = crop_region(reference_mask, reference_ct.GetSize())
+    print('[DEBUG] Loading saved transform...', flush=True)
+    transform = sitk.ReadTransform(str(args.cta_to_template_transform))
+    if transform.GetDimension() != 3:
+        raise ValueError('Step 3 transform must be 3D')
 
-    assert_same_grid(
-        fixed_cta_sitk,
-        fixed_cta_mask_sitk,
-        "Aligned CTA",
-        "Aligned CTA mask",
-    )
-    assert_same_grid(moving_ct_sitk, moving_ct_mask_sitk, "CT", "CT mask")
-    assert_same_grid(
-        fixed_cta_sitk,
-        crop_reference_mask,
-        "Aligned CTA",
-        "Template crop-reference mask",
-    )
-    fixed_cta_mask_sitk = binary_mask(fixed_cta_mask_sitk, "Aligned CTA mask")
-    moving_ct_mask_sitk = binary_mask(moving_ct_mask_sitk, "CT mask")
-    crop_reference_mask = binary_mask(crop_reference_mask, "Template crop mask")
+    # Validate that the saved transform reproduces Step 3's aligned brain mask.
+    print('[DEBUG] Validating transform by resampling mask...', flush=True)
+    remapped_mask = sitk.Resample(original_mask, aligned_cta, transform,
+                                 sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+    print('[DEBUG] Calculating validation Dice...', flush=True)
+    a = sitk.GetArrayViewFromImage(remapped_mask) > 0
+    b = sitk.GetArrayViewFromImage(aligned_mask) > 0
+    denom = int(a.sum()) + int(b.sum())
+    dice = 2.0 * np.count_nonzero(a & b) / denom if denom else 0.0
+    print(f'Step 3 transform validation (brain-mask Dice): {dice:.5f}', flush=True)
+    if dice < 0.95:
+        raise ValueError('The saved Step 3 transform does not reproduce the aligned mask. '
+                         'Verify transform direction, patient and Step 3 version before continuing.')
 
-    crop_index, crop_size = crop_region_from_template_mask(
-        crop_reference_mask,
-        crop_size_reference_ct.GetSize(),
-    )
-    print(f"Fixed crop index (XYZ): {tuple(crop_index)}")
-    print(f"Fixed crop size (XYZ):  {tuple(crop_size)}")
-
-    print("\nReading ITK registration inputs...")
-    cta_itk = itk.imread(str(cta_path), itk.F)
-    ct_itk = itk.imread(str(ct_path), itk.F)
-    cta_mask_itk = itk.imread(str(cta_mask_path), itk.UC)
-    ct_mask_itk = itk.imread(str(ct_mask_path), itk.UC)
-    registration_parameters = make_registration_parameters(args.initialization)
-
-    print("Running rigid CT-to-CTA registration...")
-    with tempfile.TemporaryDirectory(prefix="elastix_register_prepare_") as temp_dir:
-        registered_ct_itk, fitted_parameters = itk.elastix_registration_method(
-            cta_itk,
-            ct_itk,
-            fixed_mask=cta_mask_itk,
-            moving_mask=ct_mask_itk,
-            parameter_object=registration_parameters,
-            output_directory=temp_dir,
+    print('Stage A: Register CT to ORIGINAL patient CTA with Elastix...', flush=True)
+    with tempfile.TemporaryDirectory(prefix='ct_to_original_cta_') as tmp:
+        reg_ct, fitted = itk.elastix_registration_method(
+            itk.imread(str(args.original_cta), itk.F),
+            itk.imread(str(args.ct), itk.F),
+            fixed_mask=itk.imread(str(args.original_cta_mask), itk.UC),
+            moving_mask=itk.imread(str(args.ct_mask), itk.UC),
+            parameter_object=elastix_parameters(args.initialization),
+            output_directory=tmp,
             log_to_console=True,
             log_to_file=False,
         )
-
-        print("Applying the same rigid transform to the CT brain mask...")
-        registered_ct_mask_itk = itk.transformix_filter(
-            ct_mask_itk,
-            mask_transform_parameters(fitted_parameters),
-            output_directory=temp_dir,
+        reg_mask = itk.transformix_filter(
+            itk.imread(str(args.ct_mask), itk.UC),
+            mask_parameters(fitted),
+            output_directory=tmp,
         )
+        # ITK and SimpleITK share physical coordinates through NIfTI I/O.
+        ct_tmp = Path(tmp) / 'registered_CT.nii.gz'
+        mask_tmp = Path(tmp) / 'registered_CT_mask.nii.gz'
+        itk.imwrite(reg_ct, str(ct_tmp), compression=True)
+        itk.imwrite(reg_mask, str(mask_tmp), compression=True)
+        registered_ct = sitk.ReadImage(str(ct_tmp))
+        registered_mask = binary_mask(sitk.ReadImage(str(mask_tmp)))
+        require_grid(original_cta, registered_ct, 'Original CTA', 'Elastix CT result')
+        require_grid(original_cta, registered_mask, 'Original CTA', 'Elastix CT mask result')
+        params = Path(tmp) / 'TransformParameters.0.txt'
+        if not params.is_file():
+            raise FileNotFoundError(f'Elastix transform was not written: {params}')
+        shutil.copy2(params, elastix_file)
 
-        # Temporary NIfTIs provide a reliable bridge between ITK-Elastix and
-        # SimpleITK and disappear when this context exits.
-        temporary_ct = Path(temp_dir) / "registered_ct_for_preparation.nii.gz"
-        temporary_mask = Path(temp_dir) / "registered_ct_mask_for_preparation.nii.gz"
-        itk.imwrite(registered_ct_itk, str(temporary_ct), compression=True)
-        itk.imwrite(registered_ct_mask_itk, str(temporary_mask), compression=True)
-        registered_ct_sitk = sitk.ReadImage(str(temporary_ct))
-        registered_ct_mask_sitk = sitk.ReadImage(str(temporary_mask))
-
-    print("Placing all volumes on the fixed template grid...")
-    full_grid_images = {
-        "ct": resample_to_reference(
-            registered_ct_sitk,
-            fixed_cta_sitk,
-            is_mask=False,
-        ),
-        "cta": resample_to_reference(
-            fixed_cta_sitk,
-            fixed_cta_sitk,
-            is_mask=False,
-        ),
-        "ct_mask": resample_to_reference(
-            registered_ct_mask_sitk,
-            fixed_cta_sitk,
-            is_mask=True,
-        ),
-        "cta_mask": resample_to_reference(
-            fixed_cta_mask_sitk,
-            fixed_cta_sitk,
-            is_mask=True,
-        ),
+    print('Stage B: Resample registered CT and CT mask into Step 3 template grid...', flush=True)
+    ct_on_template = sitk.Resample(registered_ct, aligned_cta, transform,
+                                  sitk.sitkLinear, -1024.0, sitk.sitkFloat32)
+    mask_on_template = sitk.Resample(registered_mask, aligned_cta, transform,
+                                    sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+    full = {
+        'ct': ct_on_template,
+        'cta': sitk.Cast(aligned_cta, sitk.sitkFloat32),
+        'ct_mask': mask_on_template,
+        'cta_mask': aligned_mask,
     }
+    print(f'Fixed crop index XYZ: {tuple(crop_start)}; size XYZ: {tuple(crop_size)}')
+    for key, img in full.items():
+        cropped = sitk.RegionOfInterest(img, size=crop_size, index=crop_start)
+        sitk.WriteImage(cropped, str(outputs[key]), useCompression=True)
 
-    print("Applying the identical template crop...")
-    ready_images = {
-        key: crop_image(image, crop_index, crop_size)
-        for key, image in full_grid_images.items()
-    }
-
-    reference_ready = ready_images["cta"]
-    for key, image in ready_images.items():
-        assert_same_grid(reference_ready, image, "Ready CTA", f"Ready {key}")
-
-    for key, image in ready_images.items():
-        sitk.WriteImage(image, str(output_paths[key]), useCompression=True)
-
-    # Reload the final files to validate what was actually written.
-    saved = {key: sitk.ReadImage(str(path)) for key, path in output_paths.items()}
-    for key, image in saved.items():
-        assert_same_grid(saved["cta"], image, "Saved ready CTA", f"Saved ready {key}")
-
-    print("\nCompleted successfully. Final grid:")
-    print(f"  size:      {saved['cta'].GetSize()}")
-    print(f"  spacing:   {saved['cta'].GetSpacing()} mm")
-    print(f"  origin:    {saved['cta'].GetOrigin()}")
-    print("Outputs:")
-    for key in ("ct", "cta", "ct_mask", "cta_mask"):
-        print(f"  {output_paths[key]}")
-    print("Inspect all four outputs together before running TOPBrain.")
+    saved = {key: sitk.ReadImage(str(path)) for key, path in outputs.items()}
+    for key, img in saved.items():
+        require_grid(saved['cta'], img, 'Saved ready CTA', f'Saved {key}')
+    print('Done. All four outputs share the same grid:')
+    for path in outputs.values():
+        print(f'  {path}')
+    print(f'  {elastix_file}')
+    print('Inspect CT/CTA overlays and both masks before downstream segmentation.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

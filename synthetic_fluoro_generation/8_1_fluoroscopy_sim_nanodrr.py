@@ -182,17 +182,18 @@ def build_label_id_to_channel(label_id_to_name):
 # ============================================================
 # nanoDRR helper functions - taken from original script
 # ============================================================
-def normalise_for_display(img_2d):
-    img_2d = img_2d.astype(np.float32)
+def normalise_for_display(img_2d, p_low=5.0, p_high=99.7):
+    """Percentile-window raw NanoDRR output (display only)."""
+    img_2d = np.asarray(img_2d, dtype=np.float32)
+    valid = np.isfinite(img_2d)
+    if not np.any(valid):
+        return np.zeros_like(img_2d, dtype=np.float32)
+    low, high = np.percentile(img_2d[valid], [p_low, p_high])
+    if high <= low:
+        return np.zeros_like(img_2d, dtype=np.float32)
+    clipped = np.nan_to_num(img_2d, nan=low, posinf=high, neginf=low)
+    return np.clip((clipped - low) / (high - low), 0, 1)
 
-    low = np.percentile(img_2d, 1)
-    # Match the robust display window used by the DeepDRR comparison GUI.
-    high = np.percentile(img_2d, 99.5)
-
-    img_2d = (img_2d - low) / (high - low + 1e-8)
-    img_2d = np.clip(img_2d, 0, 1)
-
-    return img_2d
 
 # required for Qt display - greyscale to RGB uint8 converter
 def greyscale_to_rgb_uint8(img_np):
@@ -265,12 +266,14 @@ def render_ct_projection(
         sdd,
         height,
         width,
+        p_low=5.0,
+        p_high=99.7,
 ):
     with torch.no_grad():
         img = render(subject_ct, k_inv, rt_inv, sdd, height, width)
 
     img_np = img[0, 0].detach().cpu().numpy()
-    img_np = normalise_for_display(img_np)
+    img_np = normalise_for_display(img_np, p_low=p_low, p_high=p_high)
 
     return img_np
 
@@ -459,12 +462,16 @@ def render_pose_rgb(
         rt_inv=rt_inv,
         sdd=sdd,
         height=height,
-        width=width
+        width=width,
+        p_low=float(params.get("window_low", 5.0)),
+        p_high=float(params.get("window_high", 99.7)),
     )
 
     if bool(params.get("invert", True)):
         ct_np = 1.0 - ct_np
 
+    # Gamma after inversion: gamma < 1 brightens midtones.
+    ct_np = np.power(ct_np, float(params.get("gamma", 0.7)))
     rgb = greyscale_to_rgb_uint8(ct_np)
 
     if params.get("show_segmentations", False):
@@ -656,6 +663,9 @@ class FluoroControlWindow(QMainWindow):
             "label_id_to_channel": self.label_id_to_channel,
 
             "invert": True,
+            "window_low": 5.0,
+            "window_high": 99.7,
+            "gamma": 0.7,
         }
 
         self._load_subjects()
@@ -872,6 +882,37 @@ class FluoroControlWindow(QMainWindow):
         self.invert_checkbox.toggled.connect(self.set_invert_display)
 
         display_layout.addWidget(self.invert_checkbox)
+
+        self.window_low_box = QDoubleSpinBox()
+        self.window_low_box.setRange(0.0, 95.0)
+        self.window_low_box.setDecimals(1)
+        self.window_low_box.setSingleStep(1.0)
+        self.window_low_box.setValue(self.params["window_low"])
+        display_layout.addWidget(QLabel("Lower percentile (window)"))
+        display_layout.addWidget(self.window_low_box)
+
+        self.window_high_box = QDoubleSpinBox()
+        self.window_high_box.setRange(95.1, 100.0)
+        self.window_high_box.setDecimals(1)
+        self.window_high_box.setSingleStep(0.1)
+        self.window_high_box.setValue(self.params["window_high"])
+        display_layout.addWidget(QLabel("Upper percentile (window)"))
+        display_layout.addWidget(self.window_high_box)
+
+        self.gamma_box = QDoubleSpinBox()
+        self.gamma_box.setRange(0.1, 3.0)
+        self.gamma_box.setDecimals(2)
+        self.gamma_box.setSingleStep(0.05)
+        self.gamma_box.setValue(self.params["gamma"])
+        display_layout.addWidget(QLabel("Gamma (< 1 brightens)"))
+        display_layout.addWidget(self.gamma_box)
+
+        self.window_low_box.valueChanged.connect(
+            lambda v: self.set_param("window_low", float(v)))
+        self.window_high_box.valueChanged.connect(
+            lambda v: self.set_param("window_high", float(v)))
+        self.gamma_box.valueChanged.connect(
+            lambda v: self.set_param("gamma", float(v)))
         layout.addWidget(display_group)
 
         pose_group = QGroupBox("C-Arm Pose Controls")
@@ -907,22 +948,22 @@ class FluoroControlWindow(QMainWindow):
         detector_layout.addWidget(self.sdd_box)
 
         self.pixel_size_box = QDoubleSpinBox()
-        self.pixel_size_box.setRange(0.5, 5.0)
-        self.pixel_size_box.setSingleStep(0.1)
-        self.pixel_size_box.setDecimals(1)
+        self.pixel_size_box.setRange(0.05, 5.0)
+        self.pixel_size_box.setSingleStep(0.01)
+        self.pixel_size_box.setDecimals(4)
         self.pixel_size_box.setValue(self.params["pixel_size"])
         detector_layout.addWidget(QLabel("Pixel size (mm)"))
         detector_layout.addWidget(self.pixel_size_box)
 
         self.height_box = QSpinBox()
-        self.height_box.setRange(128, 512)
+        self.height_box.setRange(128, 1024)
         self.height_box.setSingleStep(64)
         self.height_box.setValue(self.params["height"])
         detector_layout.addWidget(QLabel("Height"))
         detector_layout.addWidget(self.height_box)
 
         self.width_box = QSpinBox()
-        self.width_box.setRange(128, 512)
+        self.width_box.setRange(128, 1024)
         self.width_box.setSingleStep(64)
         self.width_box.setValue(self.params["width"])
         detector_layout.addWidget(QLabel("Width"))

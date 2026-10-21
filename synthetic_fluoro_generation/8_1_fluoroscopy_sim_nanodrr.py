@@ -259,23 +259,27 @@ def make_geometry(
     return k_inv, rt_inv, sdd
 
 # renders just the CT DRR (no labels) everytime the user changes the settings on the gui
-def render_ct_projection(
-        subject_ct,
-        k_inv,
-        rt_inv,
-        sdd,
-        height,
-        width,
-        p_low=5.0,
-        p_high=99.7,
-):
+# def render_ct_projection(
+#         subject_ct,
+#         k_inv,
+#         rt_inv,
+#         sdd,
+#         height,
+#         width,
+#         p_low=5.0,
+#         p_high=99.7,
+# ):
+#     with torch.no_grad():
+#         img = render(subject_ct, k_inv, rt_inv, sdd, height, width)
+
+#     img_np = img[0, 0].detach().cpu().numpy()
+#     img_np = normalise_for_display(img_np, p_low=p_low, p_high=p_high)
+
+#     return img_np
+
+def render_ct_projection(subject_ct, k_inv, rt_inv, sdd, height, width):
     with torch.no_grad():
-        img = render(subject_ct, k_inv, rt_inv, sdd, height, width)
-
-    img_np = img[0, 0].detach().cpu().numpy()
-    img_np = normalise_for_display(img_np, p_low=p_low, p_high=p_high)
-
-    return img_np
+        return render(subject_ct, k_inv, rt_inv, sdd, height, width)
 
 # render projected segmentation labels as seperate per-label channels
 def render_label_channels(
@@ -429,6 +433,78 @@ def overlay_labels_channels_on_rgb(
         out[border] = colour
     
     return np.clip(out, 0, 255).astype(np.uint8)
+import torch.nn.functional as F
+
+# ---------- enhancement pipeline ----------
+def _blur(x):
+    k = torch.tensor([1., 4., 6., 4., 1.], device=x.device) / 16.0
+    kx = k.view(1, 1, 1, 5)
+    ky = k.view(1, 1, 5, 1)
+    x = F.conv2d(F.pad(x, (2, 2, 0, 0), mode="reflect"), kx)
+    x = F.conv2d(F.pad(x, (0, 0, 2, 2), mode="reflect"), ky)
+    return x
+
+def _up(x, size):
+    return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+
+def laplacian_pyramid(x, levels):
+    details = []
+    for _ in range(levels):
+        low = _blur(x)[..., ::2, ::2]
+        details.append(x - _up(low, x.shape[-2:]))
+        x = low
+    return details, x
+
+def reconstruct(details, residual):
+    x = residual
+    for d in reversed(details):
+        x = _up(x, d.shape[-2:]) + d
+    return x
+
+def add_quantum_noise(L, n0, seed=None):
+    """L: [1,1,H,W] line integral. Returns noisy log image (higher = denser)."""
+    L = (L - L.min()).clamp(min=0)          # air -> 0
+    gen = None
+    if seed is not None:
+        gen = torch.Generator(device=L.device).manual_seed(int(seed))
+    counts = torch.poisson(n0 * torch.exp(-L), generator=gen) / n0
+    return -torch.log(counts.clamp(min=0.5 / n0))
+
+def musica(x, levels=7, p=0.5, contrast_scale=0.05, noise_floor=0.003,
+           max_gain=10.0, level_gain=(1, 1, 1, 1, 0.6, 0.35, 0.2),
+           residual_gain=0.1):
+    levels = min(levels, int(np.log2(min(x.shape[-2:]))) - 3)
+    details, res = laplacian_pyramid(x, levels)
+    out = []
+    for i, d in enumerate(details):
+        g = (d.abs().clamp(min=noise_floor) / contrast_scale) ** (p - 1.0)
+        g = g.clamp(max=max_gain)
+        lg = level_gain[i] if i < len(level_gain) else level_gain[-1]
+        out.append(d * g * lg)
+    mean = res.mean()
+    res = mean + residual_gain * (res - mean)   # compress coarse dynamic range
+    return reconstruct(out, res)
+
+def window_01(x, lo=0.2, hi=99.8):
+    a = x.detach().cpu().numpy()[0, 0]
+    l, h = np.percentile(a, [lo, hi])
+    if h <= l:
+        return np.zeros_like(a, dtype=np.float32)
+    return np.clip((a - l) / (h - l), 0, 1).astype(np.float32)
+
+def process_drr(L, params):
+    """L: raw render tensor [1,1,H,W]. Returns float image in [0,1], dense = high."""
+    if not params.get("enhance", False):
+        img = L[0, 0].detach().cpu().numpy()
+        return normalise_for_display(img, params["window_low"], params["window_high"])
+    n0 = float(params.get("n0", 1e5))
+    log_img = add_quantum_noise(L.float(), n0, seed=params.get("noise_seed", 0))
+    enh = musica(
+        log_img,
+        p=float(params.get("musica_p", 0.5)),
+        residual_gain=float(params.get("residual_gain", 0.1)),
+    )
+    return window_01(enh)
 
 # render the image optionally with the label overlay if the user has selected to show labels
 def render_pose_rgb(
@@ -456,23 +532,35 @@ def render_pose_rgb(
         pixel_size=float(params["pixel_size"]),
     )
 
-    ct_np = render_ct_projection(
-        subject_ct=subject_ct,
-        k_inv=k_inv,
-        rt_inv=rt_inv,
-        sdd=sdd,
-        height=height,
-        width=width,
-        p_low=float(params.get("window_low", 5.0)),
-        p_high=float(params.get("window_high", 99.7)),
-    )
+    # ct_np = render_ct_projection(
+    #     subject_ct=subject_ct,
+    #     k_inv=k_inv,
+    #     rt_inv=rt_inv,
+    #     sdd=sdd,
+    #     height=height,
+    #     width=width,
+    #     p_low=float(params.get("window_low", 5.0)),
+    #     p_high=float(params.get("window_high", 99.7)),
+    # )
+
+    # if bool(params.get("invert", True)):
+    #     ct_np = 1.0 - ct_np
+
+    # # Gamma after inversion: gamma < 1 brightens midtones.
+    # ct_np = np.power(ct_np, float(params.get("gamma", 0.7)))
+    # rgb = greyscale_to_rgb_uint8(ct_np)
+
+    L = render_ct_projection(subject_ct, k_inv, rt_inv, sdd, height, width)
+    ct_np = process_drr(L, params)
 
     if bool(params.get("invert", True)):
         ct_np = 1.0 - ct_np
 
-    # Gamma after inversion: gamma < 1 brightens midtones.
-    ct_np = np.power(ct_np, float(params.get("gamma", 0.7)))
+    # gamma only on the non-enhanced path (enhancement already flattens contrast)
+    if not params.get("enhance", False):
+        ct_np = np.power(ct_np, float(params.get("gamma", 0.7)))
     rgb = greyscale_to_rgb_uint8(ct_np)
+
 
     if params.get("show_segmentations", False):
         if subject_labels is not None:
@@ -666,6 +754,13 @@ class FluoroControlWindow(QMainWindow):
             "window_low": 5.0,
             "window_high": 99.7,
             "gamma": 0.7,
+
+            # Enhancement settings
+            "enhance": False,
+            "n0": 1e5,
+            "musica_p": 0.5,
+            "residual_gain": 0.1,
+            "noise_seed": 0,
         }
 
         self._load_subjects()
@@ -913,6 +1008,38 @@ class FluoroControlWindow(QMainWindow):
             lambda v: self.set_param("window_high", float(v)))
         self.gamma_box.valueChanged.connect(
             lambda v: self.set_param("gamma", float(v)))
+
+        #Enhancement controls
+        self.enhance_checkbox = QCheckBox("Enhancement (noise + MUSICA-like)")
+        self.enhance_checkbox.setChecked(self.params["enhance"])
+        self.enhance_checkbox.toggled.connect(lambda c: self.set_param("enhance", bool(c)))
+        display_layout.addWidget(self.enhance_checkbox)
+
+        self.n0_box = QDoubleSpinBox()
+        self.n0_box.setRange(1e3, 1e7)
+        self.n0_box.setDecimals(0)
+        self.n0_box.setSingleStep(1e4)
+        self.n0_box.setValue(self.params["n0"])
+        self.n0_box.valueChanged.connect(lambda v: self.set_param("n0", float(v)))
+        display_layout.addWidget(QLabel("Photons per pixel (lower = noisier)"))
+        display_layout.addWidget(self.n0_box)
+
+        self.p_box = QDoubleSpinBox()
+        self.p_box.setRange(0.2, 1.0)
+        self.p_box.setSingleStep(0.05)
+        self.p_box.setValue(self.params["musica_p"])
+        self.p_box.valueChanged.connect(lambda v: self.set_param("musica_p", float(v)))
+        display_layout.addWidget(QLabel("Enhancement power p (lower = stronger)"))
+        display_layout.addWidget(self.p_box)
+
+        self.res_box = QDoubleSpinBox()
+        self.res_box.setRange(0.0, 1.0)
+        self.res_box.setSingleStep(0.05)
+        self.res_box.setValue(self.params["residual_gain"])
+        self.res_box.valueChanged.connect(lambda v: self.set_param("residual_gain", float(v)))
+        display_layout.addWidget(QLabel("Low-frequency gain (lower = flatter)"))
+        display_layout.addWidget(self.res_box)
+
         layout.addWidget(display_group)
 
         pose_group = QGroupBox("C-Arm Pose Controls")

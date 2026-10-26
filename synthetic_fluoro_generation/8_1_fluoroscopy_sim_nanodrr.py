@@ -386,7 +386,7 @@ def overlay_labels_channels_on_rgb(
         visible_label_ids=None,
         label_id_to_channel=None,
         fill_alpha=0.30,
-        border_width=1,
+        border_width=2,
         label_threshold=0.0,
 ):
     out = rgb.astype(np.float32).copy()
@@ -675,7 +675,7 @@ def render_pose_rgb(
                 visible_label_ids=visible_label_ids,
                 label_id_to_channel=params.get("label_id_to_channel", None),
                 fill_alpha=float(params.get("fill_alpha", 0.30)),
-                border_width=int(params.get("border_width", 1)),
+                border_width=int(params.get("border_width", 2)),
                 label_threshold=float(params.get("label_threshold", 0.0)),
             )
 
@@ -805,7 +805,7 @@ class FluoroControlWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("nanoDRR Fluoroscopy Simulator: C-Arm Control")
-        self.resize(1250, 720)
+        self.resize(1600, 820)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -822,6 +822,7 @@ class FluoroControlWindow(QMainWindow):
         self.render_requested = False
 
         self.current_rgb = None
+        self.current_mask_preview = None
         self.vessel_cache = {}
 
         self.label_id_to_name, self.label_name_to_id = load_label_mapping(self.mapping_path)
@@ -849,7 +850,7 @@ class FluoroControlWindow(QMainWindow):
             # Segmentation overlay settings
             "show_segmentations": False,
             "fill_alpha": 0.30,
-            "border_width": 1,
+            "border_width": 2,
             "label_threshold": 0.0,
             "visible_label_ids": starting_visible_ids,
             "label_id_to_channel": self.label_id_to_channel,
@@ -1304,35 +1305,57 @@ class FluoroControlWindow(QMainWindow):
 
     def _make_image_panel(self):
         panel = QWidget()
-        layout = QVBoxLayout()
-        panel.setLayout(layout)
+        layout = QVBoxLayout(panel)
 
-        title = QLabel("Live Simulated Fluoroscopy / DRR")
-        title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
+        # Two equally sized image areas: simulated DRR on the left and
+        # the independently generated axial vessel-mask MIP on the right.
+        images_row = QHBoxLayout()
+        images_row.setSpacing(10)
 
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        fluoro_title = QLabel("Live Simulated Fluoroscopy / DRR")
+        fluoro_title.setAlignment(Qt.AlignCenter)
+        left_layout.addWidget(fluoro_title)
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(400, 400)
+        self.image_label.setMinimumSize(250, 350)
         self.image_label.setStyleSheet("background-color: black;")
+        left_layout.addWidget(self.image_label, stretch=1)
 
-        layout.addWidget(self.image_label, stretch=1)
-
-        preview_title = QLabel("Extracted vessel mask: axial maximum-intensity projection (not DRR aligned)")
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        preview_title = QLabel("Extracted Vessel Mask (axial MIP — not DRR aligned)")
         preview_title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(preview_title)
+        right_layout.addWidget(preview_title)
         self.mask_preview_label = QLabel("Enable HU vessel attenuation to view mask")
         self.mask_preview_label.setAlignment(Qt.AlignCenter)
-        self.mask_preview_label.setMinimumHeight(130)
-        self.mask_preview_label.setMaximumHeight(210)
+        self.mask_preview_label.setMinimumSize(250, 350)
         self.mask_preview_label.setStyleSheet("background-color: black; color: white;")
-        layout.addWidget(self.mask_preview_label)
+        right_layout.addWidget(self.mask_preview_label, stretch=1)
+
+        images_row.addWidget(left, stretch=1)
+        images_row.addWidget(right, stretch=1)
+        layout.addLayout(images_row, stretch=1)
 
         save_button = QPushButton("Save displayed image as PNG")
         save_button.clicked.connect(self.save_current_image)
         layout.addWidget(save_button)
-
         return panel
+
+    def update_mask_preview_label(self):
+        if self.current_mask_preview is None:
+            self.mask_preview_label.clear()
+            self.mask_preview_label.setText("HU vessel extraction disabled")
+            return
+        preview = np.ascontiguousarray(self.current_mask_preview)
+        ph, pw, _ = preview.shape
+        qmask = QImage(preview.data, pw, ph, 3 * pw, QImage.Format_RGB888).copy()
+        self.mask_preview_label.setPixmap(
+            QPixmap.fromImage(qmask).scaled(
+                self.mask_preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        )
 
     def save_current_image(self):
         if self.current_rgb is None:
@@ -1621,17 +1644,8 @@ class FluoroControlWindow(QMainWindow):
     def on_render_result(self, result, elapsed):
         rgb, preview, mask_message = result
         self.current_rgb = rgb
-        if preview is None:
-            self.mask_preview_label.clear()
-            self.mask_preview_label.setText("HU vessel extraction disabled")
-        else:
-            ph, pw, _ = preview.shape
-            qmask = QImage(preview.data, pw, ph, 3 * pw, QImage.Format_RGB888).copy()
-            self.mask_preview_label.setPixmap(
-                QPixmap.fromImage(qmask).scaled(
-                    self.mask_preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-            )
+        self.current_mask_preview = preview
+        self.update_mask_preview_label()
         self.update_image_label(rgb)
 
         h, w = rgb.shape[:2]
@@ -1690,6 +1704,8 @@ class FluoroControlWindow(QMainWindow):
 
         if self.current_rgb is not None:
             self.update_image_label(self.current_rgb)
+        if self.current_mask_preview is not None:
+            self.update_mask_preview_label()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Interactive nanoDRR vessel comparison simulator")

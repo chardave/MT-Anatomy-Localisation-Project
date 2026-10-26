@@ -5,9 +5,11 @@ from pathlib import Path
 import sys
 import time
 import traceback
+import tempfile
 import nibabel as nib
 import numpy as np
 import torch
+from scipy.ndimage import maximum_filter1d, minimum_filter1d
 
 # imports for GUI
 from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool
@@ -384,7 +386,7 @@ def overlay_labels_channels_on_rgb(
         visible_label_ids=None,
         label_id_to_channel=None,
         fill_alpha=0.30,
-        border_width=2,
+        border_width=1,
         label_threshold=0.0,
 ):
     out = rgb.astype(np.float32).copy()
@@ -434,6 +436,82 @@ def overlay_labels_channels_on_rgb(
     
     return np.clip(out, 0, 255).astype(np.uint8)
 import torch.nn.functional as F
+
+# ---------- HU-derived vessels and optional TopBrain fusion ----------
+# All 3D array operations use the NIfTI array axis order, NOT NanoDRR tensor order.
+def _box_morph(mask, radius_mm, spacing, operation):
+    """Axis-wise box dilation/erosion; radius 0 means no change."""
+    result = np.asarray(mask, dtype=np.uint8)
+    if radius_mm <= 0:
+        return result.astype(bool)
+    filt = maximum_filter1d if operation == "dilate" else minimum_filter1d
+    for axis, mm in enumerate(spacing):
+        r = max(0, int(round(float(radius_mm) / float(mm))))
+        if r:
+            result = filt(result, size=2 * r + 1, axis=axis, mode="constant", cval=0)
+    return result.astype(bool)
+
+
+def extract_hu_vessels(hu, spacing, p):
+    soft = (hu > p["soft_lower"]) & (hu < p["soft_upper"])
+    brain = _box_morph(soft, p["opening_mm"], spacing, "erode")
+    brain = _box_morph(brain, p["opening_mm"], spacing, "dilate")
+    brain = _box_morph(brain, p["closing_mm"], spacing, "dilate")
+    brain = _box_morph(brain, p["closing_mm"], spacing, "erode")
+    bone = hu > p["bone_threshold"]
+    excluded = _box_morph(bone, p["bone_exclusion_mm"], spacing, "dilate")
+    candidate = brain & (hu > p["vessel_threshold"]) & ~excluded
+    candidate = _box_morph(candidate, p["vessel_dilation_mm"], spacing, "dilate")
+    return candidate & brain & ~_box_morph(bone, p["final_bone_exclusion_mm"], spacing, "dilate")
+
+
+def _prepare_vessel_subject(image_path, label_path, params, device, cache):
+    """Rebuild when mask-related settings change. Never modifies the input CTA."""
+    keys = ("vessel_threshold", "bone_threshold", "soft_lower", "soft_upper",
+            "opening_mm", "closing_mm", "bone_exclusion_mm", "vessel_dilation_mm",
+            "final_bone_exclusion_mm", "iodine_gain", "fuse_topbrain")
+    signature = (str(image_path), str(label_path), *[params[k] for k in keys])
+    if cache.get("key") == signature:
+        return cache["subject"], cache["preview"], cache["message"]
+
+    original = nib.load(str(image_path))
+    hu = np.asarray(original.dataobj, dtype=np.float32)
+    if hu.ndim != 3:
+        raise ValueError("HU vessel extraction requires a 3D CT/CTA NIfTI image")
+    spacing = nib.affines.voxel_sizes(original.affine)[:3]
+    mask = extract_hu_vessels(hu, spacing, params)
+    message = f"HU mask: {int(mask.sum()):,} voxels"
+
+    if params["fuse_topbrain"]:
+        if label_path is None or not Path(label_path).exists():
+            raise ValueError("TopBrain fusion enabled but no label map is loaded")
+        seg = nib.load(str(label_path))
+        if seg.shape != original.shape or not np.allclose(seg.affine, original.affine, atol=1e-3):
+            raise ValueError("TopBrain label map must be on exactly the CTA grid/affine for fusion. Resample labels with nearest-neighbour interpolation first.")
+        labels = np.asarray(seg.dataobj)
+        mask = mask | (labels > 0)
+        message += f" | Hybrid: {int(mask.sum()):,} voxels"
+
+    # Adjust attenuation by altering the HU values, so NanoDRR performs its own
+    # standard HU -> mu conversion. This is an approximate iodine-boost model.
+    gain = float(params["iodine_gain"])
+    adjusted = hu.copy()
+    adjusted[mask] = 40.0 + gain * np.maximum(hu[mask] - 40.0, 0.0)
+
+    # Preserve original affine and header; never overwrite the input file.
+    # An uncompressed temporary NIfTI is faster than repeatedly saving .nii.gz.
+    with tempfile.TemporaryDirectory(prefix="nanodrr_vessel_") as folder:
+        out_path = Path(folder) / "enhanced_cta.nii"
+        nib.save(nib.Nifti1Image(adjusted, original.affine, original.header), str(out_path))
+        enhanced_subject = Subject.from_filepath(str(out_path)).to(device)
+
+    # Simple axial binary MIP, not a geometrically registered DRR projection.
+    mip = np.asarray(np.max(mask, axis=2).T[::-1], dtype=np.float32)
+    preview = greyscale_to_rgb_uint8(mip)
+    cache.clear()
+    cache.update(key=signature, subject=enhanced_subject, preview=preview, message=message)
+    return enhanced_subject, preview, message
+
 
 # ---------- enhancement pipeline ----------
 def _blur(x):
@@ -503,8 +581,12 @@ def process_drr(L, params):
         log_img,
         p=float(params.get("musica_p", 0.5)),
         residual_gain=float(params.get("residual_gain", 0.1)),
+        noise_floor=float(params.get("noise_floor", 0.003)),
+        contrast_scale=float(params.get("contrast_scale", 0.05)),
+        max_gain=float(params.get("max_gain", 10.0)),
     )
-    return window_01(enh)
+    return window_01(enh, lo=float(params.get("window_low", 0.2)),
+                     hi=float(params.get("window_high", 99.8)))
 
 # render the image optionally with the label overlay if the user has selected to show labels
 def render_pose_rgb(
@@ -513,6 +595,9 @@ def render_pose_rgb(
         subject_isocenter,
         device,
         params,
+        image_path=None,
+        label_path=None,
+        vessel_cache=None,
 ):
     height = int(params["height"])
     width = int(params["width"])
@@ -550,15 +635,24 @@ def render_pose_rgb(
     # ct_np = np.power(ct_np, float(params.get("gamma", 0.7)))
     # rgb = greyscale_to_rgb_uint8(ct_np)
 
-    L = render_ct_projection(subject_ct, k_inv, rt_inv, sdd, height, width)
+    mask_preview = None
+    mask_message = ""
+    render_subject = subject_ct
+    if params.get("enable_hu_vessels", False):
+        render_subject, mask_preview, mask_message = _prepare_vessel_subject(
+            image_path, label_path, params, device, vessel_cache
+        )
+    L = render_ct_projection(render_subject, k_inv, rt_inv, sdd, height, width)
+    # NanoDRR may return multiple channels; select attenuation channel for CT DRR.
+    if L.shape[1] > 1:
+        L = L[:, :1]
     ct_np = process_drr(L, params)
 
     if bool(params.get("invert", True)):
         ct_np = 1.0 - ct_np
 
-    # gamma only on the non-enhanced path (enhancement already flattens contrast)
-    if not params.get("enhance", False):
-        ct_np = np.power(ct_np, float(params.get("gamma", 0.7)))
+    # Apply gamma on BOTH raw and enhanced paths so it always responds in the GUI.
+    ct_np = np.power(np.clip(ct_np, 0, 1), float(params.get("gamma", 0.7)))
     rgb = greyscale_to_rgb_uint8(ct_np)
 
 
@@ -581,11 +675,11 @@ def render_pose_rgb(
                 visible_label_ids=visible_label_ids,
                 label_id_to_channel=params.get("label_id_to_channel", None),
                 fill_alpha=float(params.get("fill_alpha", 0.30)),
-                border_width=int(params.get("border_width", 2)),
+                border_width=int(params.get("border_width", 1)),
                 label_threshold=float(params.get("label_threshold", 0.0)),
             )
 
-    return rgb
+    return rgb, mask_preview, mask_message
     
 # ============================================================
 # PySide helper widgets
@@ -659,6 +753,9 @@ class RenderWorker(QRunnable):
             subject_isocenter,
             device,
             params,
+            image_path=None,
+            label_path=None,
+            vessel_cache=None,
     ):
         super().__init__()
 
@@ -667,6 +764,9 @@ class RenderWorker(QRunnable):
         self.subject_isocenter = subject_isocenter
         self.device = device
         self.params = params
+        self.image_path = image_path
+        self.label_path = label_path
+        self.vessel_cache = vessel_cache
 
         self.signals = RenderSignals()
     
@@ -674,17 +774,20 @@ class RenderWorker(QRunnable):
         try:
             start = time.time()
 
-            rgb = render_pose_rgb(
+            rgb, mask_preview, mask_message = render_pose_rgb(
                 subject_ct=self.subject_ct,
                 subject_labels=self.subject_labels,
                 subject_isocenter=self.subject_isocenter,
                 device=self.device,
                 params=self.params,
+                image_path=self.image_path,
+                label_path=self.label_path,
+                vessel_cache=self.vessel_cache,
             )
             
             elapsed = time.time() - start
 
-            self.signals.result.emit(rgb, elapsed)
+            self.signals.result.emit((rgb, mask_preview, mask_message), elapsed)
 
         except Exception:
             self.signals.error.emit(traceback.format_exc())
@@ -719,6 +822,7 @@ class FluoroControlWindow(QMainWindow):
         self.render_requested = False
 
         self.current_rgb = None
+        self.vessel_cache = {}
 
         self.label_id_to_name, self.label_name_to_id = load_label_mapping(self.mapping_path)
         self.label_id_to_channel = build_label_id_to_channel(self.label_id_to_name)
@@ -745,7 +849,7 @@ class FluoroControlWindow(QMainWindow):
             # Segmentation overlay settings
             "show_segmentations": False,
             "fill_alpha": 0.30,
-            "border_width": 2,
+            "border_width": 1,
             "label_threshold": 0.0,
             "visible_label_ids": starting_visible_ids,
             "label_id_to_channel": self.label_id_to_channel,
@@ -761,6 +865,22 @@ class FluoroControlWindow(QMainWindow):
             "musica_p": 0.5,
             "residual_gain": 0.1,
             "noise_seed": 0,
+            "noise_floor": 0.003,
+            "contrast_scale": 0.05,
+            "max_gain": 10.0,
+            # Optional 3D HU vessel extraction / anatomical label fusion
+            "enable_hu_vessels": False,
+            "fuse_topbrain": False,
+            "vessel_threshold": 150.0,
+            "bone_threshold": 700.0,
+            "soft_lower": -20.0,
+            "soft_upper": 120.0,
+            "opening_mm": 4.0,
+            "closing_mm": 3.0,
+            "bone_exclusion_mm": 1.0,
+            "vessel_dilation_mm": 0.5,
+            "final_bone_exclusion_mm": 0.5,
+            "iodine_gain": 10.0,
         }
 
         self._load_subjects()
@@ -1040,7 +1160,56 @@ class FluoroControlWindow(QMainWindow):
         display_layout.addWidget(QLabel("Low-frequency gain (lower = flatter)"))
         display_layout.addWidget(self.res_box)
 
+        # Additional MUSICA controls. n0, p, residual gain and gamma exist above.
+        def add_float_control(group_layout, key, label, low, high, increment, decimals=3):
+            box = QDoubleSpinBox()
+            box.setRange(low, high)
+            box.setDecimals(decimals)
+            box.setSingleStep(increment)
+            box.setValue(float(self.params[key]))
+            box.valueChanged.connect(lambda value, k=key: self.set_param(k, float(value)))
+            group_layout.addWidget(QLabel(label))
+            group_layout.addWidget(box)
+            return box
+
+        self.noise_floor_box = add_float_control(
+            display_layout, "noise_floor", "MUSICA noise floor", 0.0001, 0.2, 0.001, 4)
+        self.contrast_scale_box = add_float_control(
+            display_layout, "contrast_scale", "MUSICA contrast scale", 0.001, 1.0, 0.005, 4)
+        self.max_gain_box = add_float_control(
+            display_layout, "max_gain", "Maximum MUSICA gain", 1.0, 50.0, 0.5, 2)
+
         layout.addWidget(display_group)
+
+        vessels_group = QGroupBox("3D HU Vessel Extraction (optional)")
+        vessels_layout = QVBoxLayout()
+        vessels_group.setLayout(vessels_layout)
+        note = QLabel("Extract high-HU vascular candidates, optionally union with loaded labels, and rerender modified CTA attenuation. Changes can take longer than gamma adjustments.")
+        note.setWordWrap(True)
+        vessels_layout.addWidget(note)
+        self.vessels_checkbox = QCheckBox("Enable HU vessel attenuation")
+        self.vessels_checkbox.setChecked(self.params["enable_hu_vessels"])
+        self.vessels_checkbox.toggled.connect(lambda v: self.set_param("enable_hu_vessels", bool(v)))
+        vessels_layout.addWidget(self.vessels_checkbox)
+        self.fusion_checkbox = QCheckBox("Include loaded TopBrain/label segmentation in mask")
+        self.fusion_checkbox.setChecked(self.params["fuse_topbrain"])
+        self.fusion_checkbox.toggled.connect(lambda v: self.set_param("fuse_topbrain", bool(v)))
+        vessels_layout.addWidget(self.fusion_checkbox)
+        self.vessel_boxes = {}
+        for key, label, lo, hi, inc, dec in [
+            ("vessel_threshold", "Vessel lower HU", 0, 700, 10, 0),
+            ("bone_threshold", "Bone threshold HU", 150, 2000, 25, 0),
+            ("soft_lower", "Brain soft-tissue lower HU", -200, 200, 5, 0),
+            ("soft_upper", "Brain soft-tissue upper HU", 0, 500, 5, 0),
+            ("opening_mm", "Brain opening radius (mm)", 0, 12, 0.5, 2),
+            ("closing_mm", "Brain closing radius (mm)", 0, 12, 0.5, 2),
+            ("bone_exclusion_mm", "Bone exclusion distance (mm)", 0, 6, 0.25, 2),
+            ("vessel_dilation_mm", "Vessel expansion (mm)", 0, 4, 0.25, 2),
+            ("final_bone_exclusion_mm", "Final bone exclusion (mm)", 0, 4, 0.25, 2),
+            ("iodine_gain", "Iodine attenuation gain (x)", 0, 30, 0.5, 2),
+        ]:
+            self.vessel_boxes[key] = add_float_control(vessels_layout, key, label, lo, hi, inc, dec)
+        layout.addWidget(vessels_group)
 
         pose_group = QGroupBox("C-Arm Pose Controls")
         pose_layout = QVBoxLayout()
@@ -1054,6 +1223,12 @@ class FluoroControlWindow(QMainWindow):
         self.trans_y_slider = FloatSlider("Translation Y (mm)", 200.0, 1500.0, self.params["trans_y"], step=10.0)
         self.trans_z_slider = FloatSlider("Translation Z (mm)", -500.0, 500.0, self.params["trans_z"], step=10.0)
 
+        views_row = QHBoxLayout()
+        for name, angle in (("AP", 0.0), ("Lateral", -90.0), ("Oblique +30", 30.0), ("Oblique -30", -30.0)):
+            button = QPushButton(name)
+            button.clicked.connect(lambda checked=False, a=angle: self.set_view_angle(a))
+            views_row.addWidget(button)
+        pose_layout.addLayout(views_row)
         pose_layout.addWidget(self.rot_x_slider)
         pose_layout.addWidget(self.rot_y_slider)
         pose_layout.addWidget(self.rot_z_slider)
@@ -1142,6 +1317,16 @@ class FluoroControlWindow(QMainWindow):
         self.image_label.setStyleSheet("background-color: black;")
 
         layout.addWidget(self.image_label, stretch=1)
+
+        preview_title = QLabel("Extracted vessel mask: axial maximum-intensity projection (not DRR aligned)")
+        preview_title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(preview_title)
+        self.mask_preview_label = QLabel("Enable HU vessel attenuation to view mask")
+        self.mask_preview_label.setAlignment(Qt.AlignCenter)
+        self.mask_preview_label.setMinimumHeight(130)
+        self.mask_preview_label.setMaximumHeight(210)
+        self.mask_preview_label.setStyleSheet("background-color: black; color: white;")
+        layout.addWidget(self.mask_preview_label)
 
         save_button = QPushButton("Save displayed image as PNG")
         save_button.clicked.connect(self.save_current_image)
@@ -1249,6 +1434,7 @@ class FluoroControlWindow(QMainWindow):
                 self.label_id_to_name, self.label_name_to_id
             )
             self._load_subjects()
+            self.vessel_cache.clear()
             self._rebuild_label_list()
 
             if self.subject_labels is None:
@@ -1349,6 +1535,19 @@ class FluoroControlWindow(QMainWindow):
         self.params["invert"] = bool(checked)
         self.request_render()
 
+    def set_view_angle(self, angle):
+        """Convenience presets under NanoDRR's existing AP orientation convention."""
+        for widget, key, value in (
+            (self.rot_x_slider, "rot_x", angle),
+            (self.rot_y_slider, "rot_y", 0.0),
+            (self.rot_z_slider, "rot_z", 0.0),
+        ):
+            widget.blockSignals(True)
+            widget.set_value(value)
+            widget.blockSignals(False)
+            self.params[key] = value
+        self.request_render()
+
     def reset_pose(self):
         defaults = {
             "rot_x": 0.0,
@@ -1408,6 +1607,9 @@ class FluoroControlWindow(QMainWindow):
             subject_isocenter=self.subject_isocenter,
             device=self.device,
             params=params_snapshot,
+            image_path=self.image_path,
+            label_path=self.label_path,
+            vessel_cache=self.vessel_cache,
         )
 
         worker.signals.result.connect(self.on_render_result)
@@ -1416,8 +1618,20 @@ class FluoroControlWindow(QMainWindow):
 
         self.threadpool.start(worker)
 
-    def on_render_result(self, rgb, elapsed):
+    def on_render_result(self, result, elapsed):
+        rgb, preview, mask_message = result
         self.current_rgb = rgb
+        if preview is None:
+            self.mask_preview_label.clear()
+            self.mask_preview_label.setText("HU vessel extraction disabled")
+        else:
+            ph, pw, _ = preview.shape
+            qmask = QImage(preview.data, pw, ph, 3 * pw, QImage.Format_RGB888).copy()
+            self.mask_preview_label.setPixmap(
+                QPixmap.fromImage(qmask).scaled(
+                    self.mask_preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            )
         self.update_image_label(rgb)
 
         h, w = rgb.shape[:2]
@@ -1432,7 +1646,7 @@ class FluoroControlWindow(QMainWindow):
         
         self.status_label.setText(
             f"Rendered on {self.device} | {w} x{h} | "
-            f"{elapsed: .3f} s | {overlay_text} | {selected_text}"
+            f"{elapsed: .3f} s | {overlay_text} | {selected_text} | {mask_message}"
         )
 
     def on_render_error(self, error_text):

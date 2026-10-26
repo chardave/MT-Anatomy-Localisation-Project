@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -59,23 +60,23 @@ LABEL_MAPPING_PATH = Path(
 # Optional preset. This only controls what starts ticked when the app opens.
 # If the preset names are not found in the current CSV, the app will simply show all labels.
 # For other datasets, you can leave this as "totalsegmentator_vascular" or set it to "all".
-DEFAULT_SELECTION_PRESET = "totalsegmentator_vascular"  # options: "totalsegmentator_vascular", "all"
+# DEFAULT_SELECTION_PRESET = "totalsegmentator_vascular"  # options: "totalsegmentator_vascular", "all"
 
 # original will only tick these default labels then others can be be imposed when checked
-DEFAULT_VISIBLE_LABEL_NAMES = [
-    "aorta",
-    "brachiocephalic_trunk",
-    "common_carotid_artery_left",
-    "common_carotid_artery_right",
-    "subclavian_artery_left",
-    "subclavian_artery_right",
-    "superior_vena_cava",
-    "heart",
-    "sternum",
-    "clavicula_left",
-    "clavicula_right",
-    "trachea",
-]
+# DEFAULT_VISIBLE_LABEL_NAMES = [
+#     "aorta",
+#     "brachiocephalic_trunk",
+#     "common_carotid_artery_left",
+#     "common_carotid_artery_right",
+#     "subclavian_artery_left",
+#     "subclavian_artery_right",
+#     "superior_vena_cava",
+#     "heart",
+#     "sternum",
+#     "clavicula_left",
+#     "clavicula_right",
+#     "trachea",
+# ]
 
 # ============================================================
 # Label mapping helpers
@@ -130,37 +131,48 @@ def load_label_mapping(mapping_path):
 
     return label_id_to_name, label_name_to_id
 
-# Set default labels to their ids
-def default_visible_label_ids(label_name_to_id):
-    ids = []
-    for label_name in DEFAULT_VISIBLE_LABEL_NAMES:
-        if label_name in label_name_to_id:
-            ids.append(label_name_to_id[label_name])
-    return set(ids)
+# # Set default labels to their ids
+# def default_visible_label_ids(label_name_to_id):
+#     ids = []
+#     for label_name in DEFAULT_VISIBLE_LABEL_NAMES:
+#         if label_name in label_name_to_id:
+#             ids.append(label_name_to_id[label_name])
+#     return set(ids)
 
-def choose_starting_visible_label_ids(label_id_to_name, label_name_to_id):
+# def choose_starting_visible_label_ids(label_id_to_name, label_name_to_id):
+#     """
+#     Decide which labels are ticked when the app starts.
+
+#     - If there is no CSV mapping, return None, meaning show all label channels.
+#     - If DEFAULT_SELECTION_PRESET is "all", tick every label in the CSV.
+#     - If the TotalSegmentator vascular preset matches this CSV, tick those labels.
+#     - If the preset does not match this dataset, fall back to all labels instead of crashing.
+#     """
+#     if not label_id_to_name:
+#         return None
+
+#     if DEFAULT_SELECTION_PRESET.lower() == "all":
+#         return set(label_id_to_name.keys())
+
+#     preset_ids = default_visible_label_ids(label_name_to_id)
+
+#     if preset_ids:
+#         return preset_ids
+
+#     print("No preset/default label names found in this mapping; starting with all labels selected.")
+#     return set(label_id_to_name.keys())
+
+def choose_starting_visible_label_ids(label_id_to_name):
     """
     Decide which labels are ticked when the app starts.
 
     - If there is no CSV mapping, return None, meaning show all label channels.
-    - If DEFAULT_SELECTION_PRESET is "all", tick every label in the CSV.
-    - If the TotalSegmentator vascular preset matches this CSV, tick those labels.
-    - If the preset does not match this dataset, fall back to all labels instead of crashing.
+    - Otherwise tick every label in the mapping.
     """
     if not label_id_to_name:
         return None
 
-    if DEFAULT_SELECTION_PRESET.lower() == "all":
-        return set(label_id_to_name.keys())
-
-    preset_ids = default_visible_label_ids(label_name_to_id)
-
-    if preset_ids:
-        return preset_ids
-
-    print("No preset/default label names found in this mapping; starting with all labels selected.")
     return set(label_id_to_name.keys())
-
 
 def build_label_id_to_channel(label_id_to_name):
     """
@@ -472,7 +484,7 @@ def _prepare_vessel_subject(image_path, label_path, params, device, cache):
             "final_bone_exclusion_mm", "iodine_gain", "fuse_topbrain")
     signature = (str(image_path), str(label_path), *[params[k] for k in keys])
     if cache.get("key") == signature:
-        return cache["subject"], cache["preview"], cache["message"]
+        return cache["subject"], cache["message"]
 
     original = nib.load(str(image_path))
     hu = np.asarray(original.dataobj, dtype=np.float32)
@@ -500,17 +512,31 @@ def _prepare_vessel_subject(image_path, label_path, params, device, cache):
 
     # Preserve original affine and header; never overwrite the input file.
     # An uncompressed temporary NIfTI is faster than repeatedly saving .nii.gz.
+    # The mask is attached as a 0/1 labelmap on the same grid, so one render gives
+    # channel 0 = non-vessel attenuation and channel 1 = vessel attenuation,
+    # both with exactly the DRR camera geometry.
     with tempfile.TemporaryDirectory(prefix="nanodrr_vessel_") as folder:
         out_path = Path(folder) / "enhanced_cta.nii"
+        mask_path = Path(folder) / "vessel_mask.nii"
         nib.save(nib.Nifti1Image(adjusted, original.affine, original.header), str(out_path))
-        enhanced_subject = Subject.from_filepath(str(out_path)).to(device)
+        nib.save(nib.Nifti1Image(mask.astype(np.uint8), original.affine), str(mask_path))
+        enhanced_subject = Subject.from_filepath(
+            str(out_path), str(mask_path), max_label=1
+        ).to(device)
 
-    # Simple axial binary MIP, not a geometrically registered DRR projection.
-    mip = np.asarray(np.max(mask, axis=2).T[::-1], dtype=np.float32)
-    preview = greyscale_to_rgb_uint8(mip)
     cache.clear()
-    cache.update(key=signature, subject=enhanced_subject, preview=preview, message=message)
-    return enhanced_subject, preview, message
+    cache.update(key=signature, subject=enhanced_subject, message=message)
+    return enhanced_subject, message
+
+
+def vessel_projection_to_rgb(vessel_2d):
+    """Display the projected vessel channel: black background, vessels bright."""
+    vessel_2d = np.asarray(vessel_2d, dtype=np.float32)
+    inside = vessel_2d > 0
+    if not np.any(inside):
+        return greyscale_to_rgb_uint8(np.zeros_like(vessel_2d))
+    high = np.percentile(vessel_2d[inside], 99.5)
+    return greyscale_to_rgb_uint8(vessel_2d / max(float(high), 1e-6))
 
 
 # ---------- enhancement pipeline ----------
@@ -639,13 +665,17 @@ def render_pose_rgb(
     mask_message = ""
     render_subject = subject_ct
     if params.get("enable_hu_vessels", False):
-        render_subject, mask_preview, mask_message = _prepare_vessel_subject(
+        render_subject, mask_message = _prepare_vessel_subject(
             image_path, label_path, params, device, vessel_cache
         )
     L = render_ct_projection(render_subject, k_inv, rt_inv, sdd, height, width)
-    # NanoDRR may return multiple channels; select attenuation channel for CT DRR.
+    # With a labelmap, NanoDRR splits each ray integral by label; the full DRR
+    # is the sum over channels. The vessel subject's channel 1 is the vessel
+    # projection, already aligned with the DRR.
     if L.shape[1] > 1:
-        L = L[:, :1]
+        if params.get("enable_hu_vessels", False):
+            mask_preview = vessel_projection_to_rgb(L[0, 1].detach().cpu().numpy())
+        L = L.sum(dim=1, keepdim=True)
     ct_np = process_drr(L, params)
 
     if bool(params.get("invert", True)):
@@ -830,8 +860,7 @@ class FluoroControlWindow(QMainWindow):
         self.label_checkboxes = {}
 
         starting_visible_ids = choose_starting_visible_label_ids(
-            self.label_id_to_name,
-            self.label_name_to_id,
+            self.label_id_to_name
         )
         
         self.params = {
@@ -960,20 +989,59 @@ class FluoroControlWindow(QMainWindow):
     
     def _build_ui(self):
         central = QWidget()
-        main_layout = QHBoxLayout()
-        central.setLayout(main_layout)
+        outer_layout = QVBoxLayout(central)
         self.setCentralWidget(central)
 
-        controls_panel = self._make_controls_panel()
-        controls_scroll = QScrollArea()
-        controls_scroll.setWidgetResizable(True)
-        controls_scroll.setWidget(controls_panel)
-        controls_scroll.setFixedWidth(430)
+        # Always-visible toolbar: panels can be restored even when hidden.
+        toolbar = QHBoxLayout()
+        self.toggle_controls_button = QPushButton("Hide controls")
+        self.toggle_controls_button.setCheckable(True)
+        self.toggle_controls_button.setChecked(True)
+        self.toggle_controls_button.toggled.connect(self.set_controls_visible)
+        toolbar.addWidget(self.toggle_controls_button)
 
-        main_layout.addWidget(controls_scroll, stretch=0)
+        self.toggle_mask_button = QPushButton("Hide vessel mask")
+        self.toggle_mask_button.setCheckable(True)
+        self.toggle_mask_button.setChecked(True)
+        self.toggle_mask_button.toggled.connect(self.set_mask_visible)
+        toolbar.addWidget(self.toggle_mask_button)
+
+        toolbar.addStretch()
+        outer_layout.addLayout(toolbar)
+
+        self.main_row = QHBoxLayout()
+        outer_layout.addLayout(self.main_row, stretch=1)
+
+        controls_panel = self._make_controls_panel()
+        self.controls_scroll = QScrollArea()
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setWidget(controls_panel)
+        self.controls_scroll.setFixedWidth(430)
+        self.main_row.addWidget(self.controls_scroll, stretch=0)
 
         image_panel = self._make_image_panel()
-        main_layout.addWidget(image_panel, stretch=1)
+        self.main_row.addWidget(image_panel, stretch=1)
+
+    def set_controls_visible(self, visible):
+        self.controls_scroll.setVisible(bool(visible))
+        self.toggle_controls_button.setText("Hide controls" if visible else "Show controls")
+        self._refresh_visible_images()
+
+    def set_mask_visible(self, visible):
+        self.mask_panel.setVisible(bool(visible))
+        self.toggle_mask_button.setText("Hide vessel mask" if visible else "Show vessel mask")
+        self._refresh_visible_images()
+
+    def _refresh_visible_images(self):
+        # Rescale after Qt has processed the new layout geometry.
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._rescale_visible_images)
+
+    def _rescale_visible_images(self):
+        if self.current_rgb is not None:
+            self.update_image_label(self.current_rgb)
+        if self.mask_panel.isVisible() and self.current_mask_preview is not None:
+            self.update_mask_preview_label()
 
     def _make_controls_panel(self):
         panel = QWidget()
@@ -1065,13 +1133,10 @@ class FluoroControlWindow(QMainWindow):
         seg_layout.addWidget(self.border_width_box)
 
         label_buttons = QHBoxLayout()
-        select_defaults_button = QPushButton("Vascular defaults")
         select_all_button = QPushButton("All")
         clear_all_button = QPushButton("None")
-        select_defaults_button.clicked.connect(self.select_default_labels)
         select_all_button.clicked.connect(self.select_all_labels)
         clear_all_button.clicked.connect(self.clear_all_labels)
-        label_buttons.addWidget(select_defaults_button)
         label_buttons.addWidget(select_all_button)
         label_buttons.addWidget(clear_all_button)
         seg_layout.addLayout(label_buttons)
@@ -1308,7 +1373,7 @@ class FluoroControlWindow(QMainWindow):
         layout = QVBoxLayout(panel)
 
         # Two equally sized image areas: simulated DRR on the left and
-        # the independently generated axial vessel-mask MIP on the right.
+        # the vessel mask rendered with the same camera geometry on the right.
         images_row = QHBoxLayout()
         images_row.setSpacing(10)
 
@@ -1319,23 +1384,26 @@ class FluoroControlWindow(QMainWindow):
         left_layout.addWidget(fluoro_title)
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(250, 350)
+        self.image_label.setMinimumSize(100, 120)
+        self.image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.image_label.setStyleSheet("background-color: black;")
         left_layout.addWidget(self.image_label, stretch=1)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
-        preview_title = QLabel("Extracted Vessel Mask (axial MIP — not DRR aligned)")
+        preview_title = QLabel("Extracted Vessel Mask (projected with DRR geometry)")
         preview_title.setAlignment(Qt.AlignCenter)
         right_layout.addWidget(preview_title)
         self.mask_preview_label = QLabel("Enable HU vessel attenuation to view mask")
         self.mask_preview_label.setAlignment(Qt.AlignCenter)
-        self.mask_preview_label.setMinimumSize(250, 350)
+        self.mask_preview_label.setMinimumSize(100, 120)
+        self.mask_preview_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.mask_preview_label.setStyleSheet("background-color: black; color: white;")
         right_layout.addWidget(self.mask_preview_label, stretch=1)
 
         images_row.addWidget(left, stretch=1)
-        images_row.addWidget(right, stretch=1)
+        self.mask_panel = right
+        images_row.addWidget(self.mask_panel, stretch=1)
         layout.addLayout(images_row, stretch=1)
 
         save_button = QPushButton("Save displayed image as PNG")
@@ -1454,7 +1522,7 @@ class FluoroControlWindow(QMainWindow):
                 self.mapping_path
             )
             self.params["visible_label_ids"] = choose_starting_visible_label_ids(
-                self.label_id_to_name, self.label_name_to_id
+                self.label_id_to_name
             )
             self._load_subjects()
             self.vessel_cache.clear()
@@ -1534,7 +1602,6 @@ class FluoroControlWindow(QMainWindow):
     def select_default_labels(self):
         ids = choose_starting_visible_label_ids(
             self.label_id_to_name,
-            self.label_name_to_id,
         )
         self.set_visible_labels(ids)
 

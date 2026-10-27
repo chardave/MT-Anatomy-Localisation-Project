@@ -9,6 +9,7 @@ import tempfile
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.ndimage import maximum_filter1d, minimum_filter1d
 
 # imports for GUI
@@ -56,27 +57,6 @@ LABEL_PATH = Path(
 LABEL_MAPPING_PATH = Path(
     r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\MT-Anatomy-Localisation-Project\metadata\totalsegmentator_label_mapping.csv"
 )
-
-# Optional preset. This only controls what starts ticked when the app opens.
-# If the preset names are not found in the current CSV, the app will simply show all labels.
-# For other datasets, you can leave this as "totalsegmentator_vascular" or set it to "all".
-# DEFAULT_SELECTION_PRESET = "totalsegmentator_vascular"  # options: "totalsegmentator_vascular", "all"
-
-# original will only tick these default labels then others can be be imposed when checked
-# DEFAULT_VISIBLE_LABEL_NAMES = [
-#     "aorta",
-#     "brachiocephalic_trunk",
-#     "common_carotid_artery_left",
-#     "common_carotid_artery_right",
-#     "subclavian_artery_left",
-#     "subclavian_artery_right",
-#     "superior_vena_cava",
-#     "heart",
-#     "sternum",
-#     "clavicula_left",
-#     "clavicula_right",
-#     "trachea",
-# ]
 
 # ============================================================
 # Label mapping helpers
@@ -130,37 +110,6 @@ def load_label_mapping(mapping_path):
     }
 
     return label_id_to_name, label_name_to_id
-
-# # Set default labels to their ids
-# def default_visible_label_ids(label_name_to_id):
-#     ids = []
-#     for label_name in DEFAULT_VISIBLE_LABEL_NAMES:
-#         if label_name in label_name_to_id:
-#             ids.append(label_name_to_id[label_name])
-#     return set(ids)
-
-# def choose_starting_visible_label_ids(label_id_to_name, label_name_to_id):
-#     """
-#     Decide which labels are ticked when the app starts.
-
-#     - If there is no CSV mapping, return None, meaning show all label channels.
-#     - If DEFAULT_SELECTION_PRESET is "all", tick every label in the CSV.
-#     - If the TotalSegmentator vascular preset matches this CSV, tick those labels.
-#     - If the preset does not match this dataset, fall back to all labels instead of crashing.
-#     """
-#     if not label_id_to_name:
-#         return None
-
-#     if DEFAULT_SELECTION_PRESET.lower() == "all":
-#         return set(label_id_to_name.keys())
-
-#     preset_ids = default_visible_label_ids(label_name_to_id)
-
-#     if preset_ids:
-#         return preset_ids
-
-#     print("No preset/default label names found in this mapping; starting with all labels selected.")
-#     return set(label_id_to_name.keys())
 
 def choose_starting_visible_label_ids(label_id_to_name):
     """
@@ -271,25 +220,6 @@ def make_geometry(
     )
 
     return k_inv, rt_inv, sdd
-
-# renders just the CT DRR (no labels) everytime the user changes the settings on the gui
-# def render_ct_projection(
-#         subject_ct,
-#         k_inv,
-#         rt_inv,
-#         sdd,
-#         height,
-#         width,
-#         p_low=5.0,
-#         p_high=99.7,
-# ):
-#     with torch.no_grad():
-#         img = render(subject_ct, k_inv, rt_inv, sdd, height, width)
-
-#     img_np = img[0, 0].detach().cpu().numpy()
-#     img_np = normalise_for_display(img_np, p_low=p_low, p_high=p_high)
-
-#     return img_np
 
 def render_ct_projection(subject_ct, k_inv, rt_inv, sdd, height, width):
     with torch.no_grad():
@@ -447,7 +377,6 @@ def overlay_labels_channels_on_rgb(
         out[border] = colour
     
     return np.clip(out, 0, 255).astype(np.uint8)
-import torch.nn.functional as F
 
 # ---------- HU-derived vessels and optional TopBrain fusion ----------
 # All 3D array operations use the NIfTI array axis order, NOT NanoDRR tensor order.
@@ -642,24 +571,6 @@ def render_pose_rgb(
         width=width,
         pixel_size=float(params["pixel_size"]),
     )
-
-    # ct_np = render_ct_projection(
-    #     subject_ct=subject_ct,
-    #     k_inv=k_inv,
-    #     rt_inv=rt_inv,
-    #     sdd=sdd,
-    #     height=height,
-    #     width=width,
-    #     p_low=float(params.get("window_low", 5.0)),
-    #     p_high=float(params.get("window_high", 99.7)),
-    # )
-
-    # if bool(params.get("invert", True)):
-    #     ct_np = 1.0 - ct_np
-
-    # # Gamma after inversion: gamma < 1 brightens midtones.
-    # ct_np = np.power(ct_np, float(params.get("gamma", 0.7)))
-    # rgb = greyscale_to_rgb_uint8(ct_np)
 
     mask_preview = None
     mask_message = ""
@@ -1116,7 +1027,7 @@ class FluoroControlWindow(QMainWindow):
         # control the transparency of the segmentation overlay - similar to ITKsnap
         self.fill_alpha_box = QDoubleSpinBox()
         self.fill_alpha_box.setRange(0.0, 1.0)
-        self.fill_alpha_box.setSingleStep(0.5)
+        self.fill_alpha_box.setSingleStep(0.05)
         self.fill_alpha_box.setDecimals(2)
         self.fill_alpha_box.setValue(self.params["fill_alpha"])
 
@@ -1550,7 +1461,7 @@ class FluoroControlWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "File Load Error",
-                f"Could not load the selected filesL \n\n{exc}",
+                f"Could not load the selected files:\n\n{exc}",
             )
 
             self.status_label.setText("Error loading files.")
@@ -1599,12 +1510,6 @@ class FluoroControlWindow(QMainWindow):
         if self.params.get("show_segmentations", False):
             self.request_render()
 
-    def select_default_labels(self):
-        ids = choose_starting_visible_label_ids(
-            self.label_id_to_name,
-        )
-        self.set_visible_labels(ids)
-
     def select_all_labels(self):
         self.set_visible_labels(set(self.label_id_to_name.keys()))
 
@@ -1648,25 +1553,23 @@ class FluoroControlWindow(QMainWindow):
             "trans_z": 0.0,
         }
 
-        widgets = [
-            self.rot_x_slider,
-            self.rot_y_slider,
-            self.rot_z_slider,
-            self.trans_x_slider,
-            self.trans_y_slider,
-            self.trans_z_slider,
-        ]
+        widgets = {
+            "rot_x": self.rot_x_slider,
+            "rot_y": self.rot_y_slider,
+            "rot_z": self.rot_z_slider,
+            "trans_x": self.trans_x_slider,
+            "trans_y": self.trans_y_slider,
+            "trans_z": self.trans_z_slider,
+        }
 
-        for w in widgets:
+        # block every slider before moving any, so the reset triggers one render, not six
+        for w in widgets.values():
             w.blockSignals(True)
-            self.rot_x_slider.set_value(defaults["rot_x"])
-            self.rot_y_slider.set_value(defaults["rot_y"])
-            self.rot_z_slider.set_value(defaults["rot_z"])
-            self.trans_x_slider.set_value(defaults["trans_x"])
-            self.trans_y_slider.set_value(defaults["trans_y"])
-            self.trans_z_slider.set_value(defaults["trans_z"]) 
-        
-        for w in widgets:
+
+        for key, w in widgets.items():
+            w.set_value(defaults[key])
+
+        for w in widgets.values():
             w.blockSignals(False)
         
         self.params.update(defaults)

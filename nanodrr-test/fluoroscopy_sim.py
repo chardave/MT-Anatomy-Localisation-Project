@@ -48,7 +48,7 @@ LABEL_PATH = Path(
 # Label mapping assigns labels to label IDs - this can be used to add the labels from 
 # other datasets which may have different names to all align to the same label name
 LABEL_MAPPING_CSV = Path(
-    r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\MT-Anatomy-Localisation-Project\metadata\topaneu_label_mapping.csv"
+    r"C:\Users\cd26\OneDrive - King's College London\MT Anatomy Localisation Project\MT-Anatomy-Localisation-Project\metadata\totalsegmentator_label_mapping.csv"
 )
 
 # Optional preset. This only controls what starts ticked when the app opens.

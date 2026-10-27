@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------
+# Patient / imaging data: never commit (KCH data must stay local)
+# ---------------------------------------------------------------
+subtraction_results/
+bone_subtraction_results/
+synth_fluoro_gen_test/
+xvr_project/input/
+xvr_project/outputs/
+
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.dcm
+*.npz
+*.npy
+*.pth
+*.pt
+*.mp4
+*.tfm
+*.itksnap
+*.xlsx
+~$*
+output.jpeg
+
+# ---------------------------------------------------------------
+# Python environments (rebuild from requirements/*.txt)
+# ---------------------------------------------------------------
+*_env/
+.*_env/
+.venv/
+venv/
+
+# ---------------------------------------------------------------
+# Python / editor clutter
+# ---------------------------------------------------------------
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+.idea/

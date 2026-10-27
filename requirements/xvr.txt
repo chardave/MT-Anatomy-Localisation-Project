@@ -1,0 +1,23 @@
+# xvr environment (Python 3.11): xvr_project/ registration experiments and
+# synthetic_fluoro_generation/generate_kch_synthetic.py (DiffDRR).
+# Kept separate because xvr pins an older PyTorch than nanoDRR.
+#
+# Install PyTorch with the CUDA build for your GPU first, e.g.
+#   pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
+# then:
+#   pip install -r requirements/xvr.txt
+
+torch==2.9.1
+torchvision==0.24.1
+xvreg==0.1.0
+diffdrr==0.6.1
+torchio==1.2.1
+nibabel==5.4.2
+numpy==2.4.6
+scipy==1.17.1
+SimpleITK==2.5.6
+opencv-python==5.0.0.93
+pandas==3.0.6
+pillow==12.3.0
+matplotlib==3.11.2
+pyvista==0.49.1

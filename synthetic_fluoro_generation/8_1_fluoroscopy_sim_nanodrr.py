@@ -10,7 +10,7 @@ import nibabel as nib
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.ndimage import maximum_filter1d, minimum_filter1d
+from scipy.ndimage import affine_transform, maximum_filter1d, minimum_filter1d
 
 # imports for GUI
 from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLineEdit,
     QLabel,
     QMainWindow,
@@ -224,6 +225,23 @@ def make_geometry(
 def render_ct_projection(subject_ct, k_inv, rt_inv, sdd, height, width):
     with torch.no_grad():
         return render(subject_ct, k_inv, rt_inv, sdd, height, width)
+
+# NanoDRR's Subject.from_filepath(ct, labels) puts the label voxels on the CT's grid, so a label
+# map from another grid (e.g. labels made on the cropped ready CTA, shown over the full aligned
+# CTA) would be drawn in the wrong place. Resample such labels onto the CT grid by physical position.
+def labels_on_ct_grid(image_path, label_path):
+    ct, lab = nib.load(str(image_path)), nib.load(str(label_path))
+    if lab.shape[:3] == ct.shape[:3] and np.allclose(lab.affine, ct.affine, atol=1e-3):
+        return Path(label_path), False
+    # CT voxel -> world -> label voxel, nearest neighbour so label IDs are never blended
+    ct_to_label_voxel = np.linalg.inv(lab.affine) @ ct.affine
+    data = np.asarray(lab.dataobj)
+    resampled = affine_transform(data, ct_to_label_voxel[:3, :3], offset=ct_to_label_voxel[:3, 3],
+                                 output_shape=ct.shape[:3], order=0, mode="constant", cval=0)
+    dtype = np.uint8 if resampled.max() <= 255 else np.uint16
+    out = Path(tempfile.gettempdir()) / f"nanodrr_labels_{Path(label_path).name.split('.')[0]}_on_{Path(image_path).name}"
+    nib.save(nib.Nifti1Image(resampled.astype(dtype), ct.affine), str(out))
+    return out, True
 
 # render projected segmentation labels as seperate per-label channels
 def render_label_channels(
@@ -620,6 +638,13 @@ def render_pose_rgb(
                 label_threshold=float(params.get("label_threshold", 0.0)),
             )
 
+    # mirror left-right last, so the DRR and the label overlay flip together
+    # (some angiography displays show the image mirrored relative to NanoDRR's camera)
+    if params.get("flip_horizontal", False):
+        rgb = np.ascontiguousarray(rgb[:, ::-1])
+        if mask_preview is not None:
+            mask_preview = np.ascontiguousarray(mask_preview[:, ::-1])
+
     return rgb, mask_preview, mask_message
     
 # ============================================================
@@ -756,6 +781,7 @@ class FluoroControlWindow(QMainWindow):
 
         self.subject_ct = None
         self.subject_labels = None
+        self.render_label_path = None  # label map on the CT grid (resampled copy if needed)
         self.subject_isocenter = None
 
         self.threadpool = QThreadPool.globalInstance()
@@ -786,6 +812,7 @@ class FluoroControlWindow(QMainWindow):
             "pixel_size": 0.6,
             "height": 512,
             "width": 512,
+            "flip_horizontal": False,
 
             # Segmentation overlay settings
             "show_segmentations": False,
@@ -846,16 +873,22 @@ class FluoroControlWindow(QMainWindow):
             if not self.label_path.exists():
                 raise FileNotFoundError(f"Label file does not exist: {self.label_path}")
             
+            # labels made on a different grid (e.g. the cropped ready CTA) are moved onto the CT grid
+            self.render_label_path, resampled = labels_on_ct_grid(self.image_path, self.label_path)
+            if resampled:
+                print(f"Label map is on a different grid from the CT; resampled onto the CT grid: "
+                      f"{self.render_label_path}")
+
             self.subject_labels = Subject.from_filepath(
                 str(self.image_path),
-                str(self.label_path),
+                str(self.render_label_path),
             ).to(self.device)
 
             # nanoDRR creates segmentation channels in sorted order of labels
             # that are actually present.  Filtering here prevents a missing
             # vessel ID from shifting every later label/colour association.
             if self.label_path.name.endswith((".nii", ".nii.gz")):
-                label_values = np.asarray(nib.load(str(self.label_path)).dataobj)
+                label_values = np.asarray(nib.load(str(self.render_label_path)).dataobj)
                 rounded = np.rint(label_values)
                 if not np.allclose(label_values, rounded, atol=1e-4, rtol=0.0):
                     raise ValueError("The segmentation contains non-integer label values.")
@@ -891,6 +924,7 @@ class FluoroControlWindow(QMainWindow):
 
         else:
             self.subject_labels = None
+            self.render_label_path = None
             print("Loaded CT subject only (no labels)")
 
         # save the isocenter for later use in camera geometry
@@ -1192,13 +1226,14 @@ class FluoroControlWindow(QMainWindow):
         pose_layout = QVBoxLayout()
         pose_group.setLayout(pose_layout)
 
-        self.rot_x_slider = FloatSlider("Rotation X (deg)", -90.0, 90.0, self.params["rot_x"], step=1.0)
-        self.rot_y_slider = FloatSlider("Rotation Y (deg)", -90.0, 90.0, self.params["rot_y"], step=1.0)
-        self.rot_z_slider = FloatSlider("Rotation Z (deg)", -180.0, 180.0, self.params["rot_z"], step=1.0)
+        # fine steps and full +-180 deg so registered poses (e.g. from xvr) can be reproduced exactly
+        self.rot_x_slider = FloatSlider("Rotation X (deg)", -180.0, 180.0, self.params["rot_x"], step=0.01, decimals=2)
+        self.rot_y_slider = FloatSlider("Rotation Y (deg)", -180.0, 180.0, self.params["rot_y"], step=0.01, decimals=2)
+        self.rot_z_slider = FloatSlider("Rotation Z (deg)", -180.0, 180.0, self.params["rot_z"], step=0.01, decimals=2)
 
-        self.trans_x_slider = FloatSlider("Translation X (mm)", -500.0, 500.0, self.params["trans_x"], step=10.0)
-        self.trans_y_slider = FloatSlider("Translation Y (mm)", 200.0, 1500.0, self.params["trans_y"], step=10.0)
-        self.trans_z_slider = FloatSlider("Translation Z (mm)", -500.0, 500.0, self.params["trans_z"], step=10.0)
+        self.trans_x_slider = FloatSlider("Translation X (mm)", -500.0, 500.0, self.params["trans_x"], step=0.1)
+        self.trans_y_slider = FloatSlider("Translation Y (mm)", 200.0, 1500.0, self.params["trans_y"], step=0.1)
+        self.trans_z_slider = FloatSlider("Translation Z (mm)", -500.0, 500.0, self.params["trans_z"], step=0.1)
 
         views_row = QHBoxLayout()
         for name, angle in (("AP", 0.0), ("Lateral", -90.0), ("Oblique +30", 30.0), ("Oblique -30", -30.0)):
@@ -1248,7 +1283,17 @@ class FluoroControlWindow(QMainWindow):
         detector_layout.addWidget(QLabel("Width"))
         detector_layout.addWidget(self.width_box)
 
+        self.flip_checkbox = QCheckBox("Flip image left-right")
+        self.flip_checkbox.setChecked(self.params["flip_horizontal"])
+        self.flip_checkbox.toggled.connect(lambda v: self.set_param("flip_horizontal", bool(v)))
+        detector_layout.addWidget(self.flip_checkbox)
+
         layout.addWidget(detector_group)
+
+        load_view_button = QPushButton("Load registered view...")
+        load_view_button.setToolTip("Set pose, detector and flip from nanodrr_settings.json (xvr_project/scripts/8_cameras_to_nanodrr.py)")
+        load_view_button.clicked.connect(self.load_registered_view)
+        layout.addWidget(load_view_button)
 
         reset_button = QPushButton("Reset pose")
         reset_button.clicked.connect(self.reset_pose)
@@ -1543,6 +1588,72 @@ class FluoroControlWindow(QMainWindow):
             self.params[key] = value
         self.request_render()
 
+    def load_registered_view(self):
+        """Apply one view from nanodrr_settings.json written by xvr_project/scripts/8_cameras_to_nanodrr.py."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select nanodrr_settings.json",
+            str(self.image_path.parent if self.image_path else Path.home()), "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                settings = json.load(handle)
+            views = settings["views"]
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Load registered view", f"Could not read {path}:\n{exc}")
+            return
+        # poses.json / cameras.json from the xvr scripts also have "views", but not simulator settings
+        required = ("rot_x", "rot_y", "rot_z", "trans_x", "trans_y", "trans_z", "sdd", "pixel_size", "height", "width")
+        if not isinstance(views, dict) or not views or not all(
+                isinstance(v, dict) and all(k in v for k in required) for v in views.values()):
+            QMessageBox.warning(
+                self, "Load registered view",
+                f"{Path(path).name} does not contain simulator settings.\n\n"
+                "Choose nanodrr_settings.json, made by xvr_project/scripts/8_cameras_to_nanodrr.py "
+                "(run 7_export_registered_cameras.py first). poses.json and cameras.json cannot be loaded here.")
+            return
+        names = list(views)
+        if len(names) > 1:
+            name, ok = QInputDialog.getItem(self, "Load registered view", "View:", names, 0, False)
+            if not ok:
+                return
+        else:
+            name = names[0]
+        view = views[name]
+
+        # the translation is measured from the centre of the CT the settings were made for
+        settings_ct = Path(settings.get("ct", "")).name
+        if self.image_path is not None and settings_ct and settings_ct != self.image_path.name:
+            QMessageBox.warning(
+                self, "Load registered view",
+                f"These settings were made for {settings_ct}, but {self.image_path.name} is loaded.\n"
+                "The rotation still applies, but the translation will be wrong unless the volumes share "
+                "the same centre. Load the matching CT, or rerun 8_cameras_to_nanodrr.py with --ct.")
+
+        sliders = {"rot_x": self.rot_x_slider, "rot_y": self.rot_y_slider, "rot_z": self.rot_z_slider,
+                   "trans_x": self.trans_x_slider, "trans_y": self.trans_y_slider, "trans_z": self.trans_z_slider}
+        boxes = {"sdd": self.sdd_box, "pixel_size": self.pixel_size_box,
+                 "height": self.height_box, "width": self.width_box}
+        # block every control before moving any, so loading triggers one render
+        widgets = list(sliders.values()) + list(boxes.values()) + [self.flip_checkbox]
+        for w in widgets:
+            w.blockSignals(True)
+        for key, w in sliders.items():
+            w.set_value(float(view[key]))
+            self.params[key] = float(view[key])
+        for key, w in boxes.items():
+            value = int(view[key]) if key in ("height", "width") else float(view[key])
+            w.setValue(value)
+            self.params[key] = value
+        self.flip_checkbox.setChecked(bool(view.get("flip_horizontal", False)))
+        self.params["flip_horizontal"] = bool(view.get("flip_horizontal", False))
+        for w in widgets:
+            w.blockSignals(False)
+        # the slider labels only refresh on their own signal, so update them directly
+        for key, w in sliders.items():
+            w._update_label(self.params[key])
+        self.request_render()
+
     def reset_pose(self):
         defaults = {
             "rot_x": 0.0,
@@ -1601,7 +1712,7 @@ class FluoroControlWindow(QMainWindow):
             device=self.device,
             params=params_snapshot,
             image_path=self.image_path,
-            label_path=self.label_path,
+            label_path=self.render_label_path,
             vessel_cache=self.vessel_cache,
         )
 

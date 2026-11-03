@@ -34,7 +34,7 @@ CONVERTER_PYTHON="$TOPBRAIN_ROOT/convert_env/bin/python"
 CASE_ROOT="$TOPBRAIN_ROOT/cases/$CASE_ID"
 CTA="$CASE_ROOT/input/10_ready_CTA.nii.gz"
 FINAL_OUTPUT_DIR="$CASE_ROOT/output"
-FINAL_PREDICTION="$FINAL_OUTPUT_DIR/11_CTA_vessel_labels.nii.gz"
+FINAL_PREDICTION="$FINAL_OUTPUT_DIR/13_CTA_vessel_labels.nii.gz"
 
 # Writable working directory required by the KDH container.
 JOB_WORK="$TOPBRAIN_ROOT/work_kdh_ready/$CASE_ID/$SLURM_JOB_ID"
@@ -89,16 +89,53 @@ SINGULARITY_COMMAND=(
     "$SIF"
 )
 
-echo "Checking patched KDH PyTorch environment..."
-"${SINGULARITY_COMMAND[@]}" python -c '
+check_cuda() {
+    "${SINGULARITY_COMMAND[@]}" python -c '
+import sys
 import torch
 print("PyTorch:", torch.__version__)
 print("CUDA build:", torch.version.cuda)
 print("CUDA available:", torch.cuda.is_available())
 if not torch.cuda.is_available():
-    raise SystemExit("ERROR: CUDA is not available in the patched KDH environment")
+    sys.exit(1)
 print("GPU:", torch.cuda.get_device_name(0))
 '
+}
+
+echo "Checking patched KDH PyTorch environment..."
+if ! check_cuda; then
+    # On some nodes Singularity cannot list the host NVIDIA driver libraries
+    # ("could not retrieve ld cache: /usr/sbin/ldconfig.real"), so --nv binds
+    # nothing. Copy the driver libraries into the job folder and put them on the
+    # container's library path instead.
+    echo "CUDA not visible through --nv; retrying with the host NVIDIA libraries bound explicitly..."
+    HOST_NV="$JOB_WORK/host_nvidia_libs"
+    mkdir -p "$HOST_NV"
+    for dir in /usr/lib64 /usr/lib/x86_64-linux-gnu /lib64 /lib/x86_64-linux-gnu /usr/lib64/nvidia /usr/lib/nvidia; do
+        [[ -d "$dir" ]] || continue
+        find "$dir" -maxdepth 1 \( -name 'libcuda.so*' -o -name 'libnvidia-ml.so*' \
+            -o -name 'libnvidia-ptxjitcompiler.so*' -o -name 'libnvidia-nvvm.so*' \
+            -o -name 'libnvidia-gpucomp.so*' \) -exec cp -L -n {} "$HOST_NV/" \; 2>/dev/null || true
+    done
+    if ! ls "$HOST_NV"/libcuda.so* >/dev/null 2>&1; then
+        echo "ERROR: no libcuda.so found on $HOSTNAME; report the node to CREATE support."
+        exit 1
+    fi
+    echo "Host NVIDIA libraries: $(ls "$HOST_NV" | tr '\n' ' ')"
+
+    # same command, with the copied libraries bound in before the image path
+    last=$((${#SINGULARITY_COMMAND[@]} - 1))
+    SINGULARITY_COMMAND=(
+        "${SINGULARITY_COMMAND[@]:0:$last}"
+        --bind "$HOST_NV:/opt/host_nvidia:ro"
+        --env LD_LIBRARY_PATH=/opt/host_nvidia
+        "$SIF"
+    )
+    if ! check_cuda; then
+        echo "ERROR: CUDA is not available in the patched KDH environment, even with the host libraries."
+        exit 1
+    fi
+fi
 
 echo "Starting KDH inference..."
 setsid "${SINGULARITY_COMMAND[@]}" python /opt/app/inference.py \
@@ -195,7 +232,27 @@ if [[ "$size_before" -ne "$size_after" ]]; then
 fi
 
 echo "Converting KDH output.mha to an integer NIfTI label map..."
-"$CONVERTER_PYTHON" - "$PREDICTION_MHA" "$CTA" "$FINAL_PREDICTION" <<'PY'
+# convert_env stops working on nodes whose system Python differs from the one it was
+# built with (its packages are then not found). Fall back to the container's Python,
+# which only sees the job folder (mounted at /work), so it reads the CTA copy made for
+# the container and writes into /work; the result is copied out afterwards.
+CONVERT_IN_CONTAINER=0
+if "$CONVERTER_PYTHON" -c "import numpy, SimpleITK" >/dev/null 2>&1; then
+    CONVERT=("$CONVERTER_PYTHON" - "$PREDICTION_MHA" "$CTA" "$FINAL_PREDICTION")
+elif "${SINGULARITY_COMMAND[@]}" python -c "import numpy, SimpleITK" >/dev/null 2>&1; then
+    echo "convert_env cannot import numpy/SimpleITK on $HOSTNAME; converting with the container's Python."
+    CONVERT_IN_CONTAINER=1
+    CONVERT=("${SINGULARITY_COMMAND[@]}" python -
+             "/work/${PREDICTION_MHA#"$JOB_WORK"/}"
+             "/work/${CONTAINER_INPUT#"$JOB_WORK"/}/10_ready_CTA.nii.gz"
+             "/work/$(basename "$FINAL_PREDICTION")")
+else
+    echo "ERROR: neither convert_env nor the container can import numpy and SimpleITK."
+    echo "The prediction is kept at: $PREDICTION_MHA"
+    echo "Recreate convert_env on a compute node, or convert that file elsewhere."
+    exit 1
+fi
+"${CONVERT[@]}" <<'PY'
 from pathlib import Path
 import sys
 
@@ -256,6 +313,10 @@ print("Size:", saved.GetSize())
 print("Spacing:", saved.GetSpacing())
 print("Label range:", minimum, "to", maximum)
 PY
+
+if [[ "$CONVERT_IN_CONTAINER" == "1" ]]; then
+    cp "$JOB_WORK/$(basename "$FINAL_PREDICTION")" "$FINAL_PREDICTION"
+fi
 
 echo
 echo "KDH segmentation completed successfully."

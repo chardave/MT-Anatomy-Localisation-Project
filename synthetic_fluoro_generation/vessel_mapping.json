@@ -4,9 +4,9 @@
         "BA": 1,
         "R-P1P2": 2,
         "L-P1P2": 3,
-        "R-ICA-C6-C7": 4,
+        "R-ICA": 4,
         "R-M1": 5,
-        "L-ICA-C6-C7": 6,
+        "L-ICA": 6,
         "L-M1": 7,
         "R-Pcom": 8,
         "L-Pcom": 9,
@@ -35,7 +35,11 @@
         "L-AChA": 32,
         "R-OA": 33,
         "L-OA": 34,
-        "R-ICA-C1-C5": 35,
-        "L-ICA-C1-C5": 36
+        "VoG": 35,
+        "StS": 36,
+        "ICVs": 37,
+        "R-BVR": 38,
+        "L-BVR": 39,
+        "SSS": 40
     }
 }

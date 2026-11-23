@@ -12,9 +12,10 @@ moment, so use the Live panels for registration.
 
 Two modes:
   --pair       save Live A, Live B and the status panel from the SAME frame, with no
-               window: <prefix>_AP.png, <prefix>_LAT.png, <prefix>_details.png. Read the
+               window: originals\<prefix>_AP.png, _LAT.png and _details.png. Read the
                angles, zoom and SID for 5_fluoro_png_to_dicom.py from the details image,
-               because the zoom can change during a procedure.
+               because the zoom can change during a procedure. --column Ref1 or Ref2
+               saves the middle or right panels instead of Live.
   (default)    show the frame and choose one panel: keys 1-6 as in the layout above,
                M to draw a rectangle yourself, Q/Esc to cancel.
 
@@ -106,6 +107,8 @@ def main():
                         help="Save Live A, Live B and the status panel from this frame, without a window")
     parser.add_argument("--prefix", default=None,
                         help="--pair file name prefix (default: frame_t<time>)")
+    parser.add_argument("--column", choices=list(COLUMN_X), default="Live",
+                        help="--pair column to save: Live (left, default), Ref1 (middle) or Ref2 (right)")
     parser.add_argument("--inset", type=int, default=0,
                         help="Trim this many ORIGINAL pixels from each side of a panel")
     parser.add_argument("--max-display-width", type=int, default=1200,
@@ -149,11 +152,18 @@ def main():
     # ---- pair mode: both live planes and the status panel from one frame ----
     if args.pair:
         prefix = args.prefix or f"frame_{stamp}"
-        for suffix, (column, row) in (("AP", PANELS[1]), ("LAT", PANELS[4])):
-            image, box = crop(frame, panel_box(column, row, W, H), args.inset)
-            save(args.output_dir / f"{prefix}_{suffix}.png", image)
+        # raw crops and the status panel are only read by step 9 and by you, so keep them
+        # out of the main folder; 4_mask_fluoro_overlays.py writes its result back up a level
+        originals = args.output_dir / "originals"
+        originals.mkdir(parents=True, exist_ok=True)
+        for suffix, row in (("AP", "A"), ("LAT", "B")):
+            image, box = crop(frame, panel_box(args.column, row, W, H), args.inset)
+            save(originals / f"{prefix}_{suffix}.png", image)
+        if args.column != "Live":
+            print(f"Saved the {args.column} panels: reference images can come from an earlier moment, "
+                  "so the details panel may not describe them.")
         details, _ = crop(frame, scale_box(STATUS_PANEL, W, H))
-        save(args.output_dir / f"{prefix}_details.png", details)
+        save(originals / f"{prefix}_details.png", details)
         print("Read plane A (AP) and plane B (LAT) angles, zoom (cm) and SID (cm) from the details image.")
         return
 

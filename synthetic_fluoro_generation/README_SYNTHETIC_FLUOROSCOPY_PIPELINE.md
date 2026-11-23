@@ -18,9 +18,9 @@ The pipeline combines CT/CTA preprocessing, brain-mask generation, rigid registr
 |---:|---|---|
 | 1 | Reorient CT and CTA to LPS | LPS CT and CTA |
 | 2 | Generate brain masks with TotalSegmentator | CT and CTA brain masks |
-| 3 | Rigidly align the CTA to the common template | Template-aligned CTA |
-| 4 | Rigidly register the CT to the aligned CTA | Registered CT |
-| 5 | Resample and crop every image onto the template grid | Ready CT, CTA, and masks |
+| 3 | Optional (template grid only): rigidly align the CTA to the common template | Template-aligned CTA |
+| 4 | Rigidly register the CT to the CTA | Registered CT |
+| 5 | Crop every image onto the ready grid (native CTA or template) | Ready CT, CTA, and masks |
 | 6 | Segment cerebral vessels with TOPBrain KDH | Vessel label map |
 | 7 | Convert and validate the vessel prediction | Ready vessel-mask NIfTI |
 | 8 | Enhance vessel-labelled voxels in the CT | Vessel-enhanced CT |
@@ -151,7 +151,22 @@ Retain the brain masks as:
 
 Before continuing, open each image and mask together and confirm that the mask correctly covers the brain.
 
-### Step 3: Align the CTA to the common template
+### Choosing the ready grid
+
+`4_register_ct_to_cta_elastix.py --grid` chooses where the ready volumes live:
+
+| `--grid` | Use when | Step 3 needed |
+|---|---|---|
+| `native` (default) | xvr registers the volume to real fluoroscopy. xvr finds each head's pose itself, so a common orientation adds nothing. The CTA is only cropped (never resampled) and the CT is interpolated once. | No |
+| `template` | Rendering canonical angles across patients without real fluoroscopy, or comparing patients in one coordinate frame. | Yes |
+
+The native grid crops the CTA to its brain mask plus `--margins-mm SIDE FRONT BACK TOP BOTTOM` (default `45 60 45 35 90`, matching xvr's head crop, which keeps the skull base and face). Native volumes are larger than template volumes (case 45: 505 × 512 × 632 at 0.43 × 0.43 × 0.4 mm). `ready_grid.json` records which grid was used.
+
+xvr poses are relative to the volume that was registered, so do not mix grids for one case: if a case is re-run on a different grid, re-run its xvr registration too.
+
+### Step 3: Align the CTA to the common template (template grid only)
+
+Skip this step with `--grid native`.
 
 Run:
 
@@ -264,6 +279,8 @@ README_CREATE_TOPBRAIN.md
 TOPBrain may initially produce an `.mha` prediction. Download the completed prediction from CREATE.
 
 > Establish model performance using a full-field LPS CTA before replacing it with a tightly cropped input. Removing head or neck context may affect segmentation performance.
+
+**Alternative / additional segmentation: arterial.** arterial (FLOWCAT-CV) produces a binary vessel mask, covering the head only or the aortic arch through to the Circle of Willis. It can be run on the same Ready CTA for comparison with TopBrain, and on the uncropped CTA for neck vessels. See [README_CREATE_ARTERIAL.md](README_CREATE_ARTERIAL.md).
 
 ### Step 7: Convert and validate the vessel prediction
 

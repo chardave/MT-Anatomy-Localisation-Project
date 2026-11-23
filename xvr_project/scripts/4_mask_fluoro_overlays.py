@@ -2,12 +2,18 @@
 
 Draw one rectangle over each overlay (hospital name, date, protocol text, grey bars).
 The covered pixels are filled from the surrounding image (inpainting), so the
-registration sees no sharp text edges. The rectangles are saved to JSON, so the
-same mask can be re-applied without drawing again (--rects).
+registration sees no sharp text edges. With --save-rects the rectangles are also saved
+to JSON, so the same mask can be re-applied without drawing again (--rects).
+
+Saves <stem>_masked.png (for step 10) next to the image (or one level up when the image
+is in the originals\ folder written by extract_fluoroscopy.py), and in a checks\ subfolder
+<stem>_mask.png (for compare_to_ground_truth.py --mask), <stem>_mask_check.png
+(before/after check) and, with --save-rects, <stem>_mask_rects.json.
 
 Requirements: opencv-python, numpy (xvr environment)
 Example:
     python 4_mask_fluoro_overlays.py --image ..\\input\\fluoro_43\\fluoro_AP_non_contrast.png
+    python 4_mask_fluoro_overlays.py --image ... --save-rects
     python 4_mask_fluoro_overlays.py --image ... --rects ..\\input\\fluoro_43\\fluoro_AP_non_contrast_mask_rects.json
 """
 
@@ -59,6 +65,8 @@ def main():
     parser.add_argument("--image", required=True, type=Path, help="Snapshot PNG from extract_fluoroscopy.py")
     parser.add_argument("--rects", type=Path,
                         help="Re-use rectangles saved by a previous run instead of drawing them")
+    parser.add_argument("--save-rects", action="store_true",
+                        help="Also save the drawn rectangles to <stem>_mask_rects.json for reuse with --rects")
     parser.add_argument("--output-dir", type=Path, help="Default: same folder as --image")
     parser.add_argument("--fill", choices=["inpaint", "white"], default="inpaint",
                         help="inpaint = fill from surrounding image (default); white = paint as air")
@@ -74,7 +82,10 @@ def main():
     if gray is None:
         raise RuntimeError(f"Cannot read image: {args.image}")
     out_dir = args.output_dir or args.image.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_dir is None and args.image.parent.name == "originals":
+        out_dir = args.image.parent.parent  # extract_fluoroscopy.py --pair crops: results go to the main folder
+    check_dir = out_dir / "checks"
+    check_dir.mkdir(parents=True, exist_ok=True)
     stem = args.image.stem
 
     # ---- 1. get the rectangles (drawn now, or loaded from an earlier run) ----
@@ -86,10 +97,11 @@ def main():
         if not rects:
             print("No rectangles drawn; nothing saved.")
             return
-        rects_path = out_dir / f"{stem}_mask_rects.json"
-        rects_path.write_text(json.dumps({"image": args.image.name, "size_wh": [gray.shape[1], gray.shape[0]],
-                                          "rects": rects}, indent=2), encoding="utf-8")
-        print(f"Saved rectangles: {rects_path}")
+        if args.save_rects:
+            rects_path = check_dir / f"{stem}_mask_rects.json"
+            rects_path.write_text(json.dumps({"image": args.image.name, "size_wh": [gray.shape[1], gray.shape[0]],
+                                              "rects": rects}, indent=2), encoding="utf-8")
+            print(f"Saved rectangles: {rects_path}")
 
     # ---- 2. fill the covered pixels ----
     mask = build_mask(gray.shape, rects, args.grow)
@@ -102,15 +114,16 @@ def main():
     # ---- 3. save the result, the mask and a before/after check image ----
     masked_path = out_dir / f"{stem}_masked.png"
     cv2.imwrite(str(masked_path), masked)
-    cv2.imwrite(str(out_dir / f"{stem}_mask.png"), mask)
+    cv2.imwrite(str(check_dir / f"{stem}_mask.png"), mask)
     outline = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     for x0, y0, x1, y1 in rects:
         cv2.rectangle(outline, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 255), 1)
     check = np.hstack([outline, cv2.cvtColor(masked, cv2.COLOR_GRAY2BGR)])
-    cv2.imwrite(str(out_dir / f"{stem}_mask_check.png"), check)
+    cv2.imwrite(str(check_dir / f"{stem}_mask_check.png"), check)
     print(f"Saved masked image: {masked_path}")
+    print(f"Saved mask and check image in: {check_dir}")
     print(f"Covered {int((mask > 0).sum())} pixels ({100 * (mask > 0).mean():.1f}% of the image)")
-    print(f"Open {stem}_mask_check.png to confirm all text is gone (left = boxes, right = result).")
+    print(f"Open checks\\{stem}_mask_check.png to confirm all text is gone (left = boxes, right = result).")
 
 
 if __name__ == "__main__":

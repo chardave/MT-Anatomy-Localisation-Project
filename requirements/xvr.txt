@@ -21,3 +21,6 @@ pandas==3.0.6
 pillow==12.3.0
 matplotlib==3.11.2
 pyvista==0.49.1
+# extract_details_panel.py (OCR of the details panel in the screen recordings)
+rapidocr-onnxruntime==1.4.4
+openpyxl==3.1.5

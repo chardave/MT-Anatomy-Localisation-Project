@@ -557,6 +557,7 @@ def process_drr(L, params):
         noise_floor=float(params.get("noise_floor", 0.003)),
         contrast_scale=float(params.get("contrast_scale", 0.05)),
         max_gain=float(params.get("max_gain", 10.0)),
+        level_gain=tuple(params.get("level_gain", (1, 1, 1, 1, 0.6, 0.35, 0.2))),
     )
     return window_01(enh, lo=float(params.get("window_low", 0.2)),
                      hi=float(params.get("window_high", 99.8)))

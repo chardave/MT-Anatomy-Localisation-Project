@@ -19,7 +19,7 @@ Requirements: numpy, scipy, Pillow, matplotlib (fluoro environment)
 Example:
     python compare_to_ground_truth.py ^
         --real ..\\xvr_project\\input\\fluoro_43\\fluoro_AP_non_contrast_masked.png ^
-        --mask ..\\xvr_project\\input\\fluoro_43\\fluoro_AP_non_contrast_mask.png ^
+        --mask ..\\xvr_project\\input\\fluoro_43\\checks\\fluoro_AP_non_contrast_mask.png ^
         --synth ..\\xvr_project\\outputs\\registration\\case_43\\nanodrr_fluoroscopy_AP_registered.png ^
                 ..\\xvr_project\\outputs\\registration\\case_43\\nanodrr_fluoroscopy_AP_registered_updated.png
 Add --interactive to open a window with a slider that fades between the two images.
